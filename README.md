@@ -2,6 +2,8 @@
 
 MIDI-driven 3D music machines in the browser. Every note is scheduled ahead of time so its visual hit lands exactly on the beat.
 
+**Live:** https://jacksonwholesale.github.io/pipe-rig/ (drag `.mid` files onto the page; MIDI devices work there in Chrome or Edge)
+
 ## Machines
 
 - **Pipe Rig** — a central launcher fires balls in ballistic arcs onto a ring of instruments (marimba, vibraphone, glockenspiel, harp, horn pipes, bass strings, drum kit). Each part of a song gets its own instrument station.
