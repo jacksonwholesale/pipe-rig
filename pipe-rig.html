@@ -145,6 +145,10 @@ body.dropping #stage { outline: 3px dashed var(--copper); outline-offset: -12px;
     <span class="label">Instruments</span>
     <span class="chips" id="kindChips" role="group" aria-label="Instrument types used for every song"></span>
   </div>
+  <div class="row" id="fxRow">
+    <span class="label">Effects</span>
+    <span class="chips" id="fxChips" role="group" aria-label="Visual and sound effects"></span>
+  </div>
   <div class="row">
     <span class="label">Live</span>
     <button id="midiBtn">Connect MIDI input</button>
@@ -167,12 +171,35 @@ body.dropping #stage { outline: 3px dashed var(--copper); outline-offset: -12px;
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/CopyShader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/LuminosityHighPassShader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/GammaCorrectionShader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/EffectComposer.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/RenderPass.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/ShaderPass.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/UnrealBloomPass.js"></script>
 <script>
 (() => {
 const $ = s => document.querySelector(s);
 const nowSec = () => performance.now() / 1000;
 const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
 const V = (x, y, z) => new THREE.Vector3(x, y, z);
+
+// ---------- effects: each can be switched off in the panel, remembered in this browser ----------
+const FX_INFO = [
+  ['lights', 'Hit lights', 'Each hit throws a burst of colored light onto the scene'],
+  ['glow', 'Glow', 'Lit-up and bright surfaces bloom with a soft halo'],
+  ['hold', 'Held notes', 'Notes last their full length: held notes keep sounding and stay lit'],
+  ['samples', 'Sampled sounds', 'Recorded instruments instead of the built-in synth (drums stay synthesized)'],
+  ['reverb', 'Reverb', 'A room around the sound'],
+  ['returns', 'Ball returns', 'Pipe Rig balls drop into catchers and roll back to the launcher'],
+  ['director', 'Auto camera', 'The camera follows the busiest instrument; drag or scroll to take over for a while'],
+];
+const FX = Object.fromEntries(FX_INFO.map(([k]) => [k, true]));
+try {
+  const saved = JSON.parse(localStorage.getItem('pipeRig.fx'));
+  if (saved) for (const k in FX) if (typeof saved[k] === 'boolean') FX[k] = saved[k];
+} catch { /* no storage: everything on */ }
 
 // ---------- renderer / scene ----------
 const canvas = $('#stage');
@@ -196,6 +223,7 @@ function resize() {
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
   reflRT.setSize(Math.round(w * renderer.getPixelRatio() * 0.6), Math.round(h * renderer.getPixelRatio() * 0.6));
+  if (composer) { const pr = renderer.getPixelRatio(); composer.setSize(w * pr, h * pr); }
 }
 addEventListener('resize', resize);
 
@@ -216,6 +244,40 @@ pipeWorld.add(ground);
 const ring = new THREE.Mesh(new THREE.RingGeometry(0.99, 1, 160), new THREE.MeshBasicMaterial({ color: 0x2b3546 }));
 ring.rotation.x = -Math.PI / 2; ring.position.y = 0.01;
 pipeWorld.add(ring);
+
+
+// ---------- hit lights: a small pool of point lights, each lent to the latest hit ----------
+const hitLights = [];
+for (let i = 0; i < 6; i++) {
+  const l = new THREE.PointLight(0xffffff, 0, 6, 2);
+  Object.assign(l.userData, { t0: -10, peak: 0, k: 9 });
+  scene.add(l); hitLights.push(l);
+}
+let hitLightIdx = 0;
+const pitchColor = n => new THREE.Color().setHSL((n % 12) / 12, 0.8, 0.6);
+function flashAt(pos, color, vel, reach = 6, fade = 9) {
+  if (!FX.lights) return;
+  const l = hitLights[hitLightIdx++ % hitLights.length];
+  l.position.copy(pos); l.color.copy(color); l.distance = reach;
+  Object.assign(l.userData, { t0: nowSec(), peak: 0.6 + 1.8 * vel, k: fade });
+}
+function updateHitLights(now) {
+  for (const l of hitLights) {
+    const d = now - l.userData.t0;
+    l.intensity = FX.lights && d >= 0 && d < 2 ? l.userData.peak * Math.exp(-d * l.userData.k) : 0;
+  }
+}
+
+// ---------- glow: bloom post-processing; without the add-on scripts the page renders plainly ----------
+let composer = null, bloomPass = null;
+if (THREE.EffectComposer && THREE.RenderPass && THREE.UnrealBloomPass && THREE.ShaderPass && THREE.GammaCorrectionShader) {
+  composer = new THREE.EffectComposer(renderer, new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType }));
+  composer.addPass(new THREE.RenderPass(scene, camera));
+  bloomPass = new THREE.UnrealBloomPass(new THREE.Vector2(1, 1), 0.9, 0.5, 0.72);
+  composer.addPass(bloomPass);
+  composer.addPass(new THREE.ShaderPass(THREE.GammaCorrectionShader));   // the render targets are linear
+}
+function setBloom(strength, radius, threshold) { if (bloomPass) Object.assign(bloomPass, { strength, radius, threshold }); }
 
 // ---------- camera orbit ----------
 const orbit = { theta: 0.15, phi: 0.48, r: 22, target: V(0, 1.8, -1) };
@@ -253,7 +315,7 @@ const darkMat = shared(new THREE.MeshStandardMaterial({ color: 0x232a37, metalne
 const brassMat = shared(new THREE.MeshStandardMaterial({ color: 0xc9a14a, metalness: 0.8, roughness: 0.3 }));
 
 // ---------- audio ----------
-let actx = null, master = null, noiseBuf = null, soundOn = false;
+let actx = null, master = null, noiseBuf = null, soundOn = false, reverbWet = null;
 const mtof = n => 440 * Math.pow(2, (n - 69) / 12);
 function ensureAudio() {
   if (!actx) {
@@ -261,11 +323,31 @@ function ensureAudio() {
     const comp = actx.createDynamicsCompressor();
     master = actx.createGain(); master.gain.value = 0.5;
     master.connect(comp).connect(actx.destination);
+    // reverb: a generated room tail mixed in beside the dry signal
+    const conv = actx.createConvolver(); conv.buffer = roomImpulse(2.4);
+    reverbWet = actx.createGain(); reverbWet.gain.value = FX.reverb ? 0.3 : 0;
+    master.connect(conv).connect(reverbWet).connect(comp);
     noiseBuf = actx.createBuffer(1, actx.sampleRate, actx.sampleRate);
     const d = noiseBuf.getChannelData(0);
     for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    preloadSamples();
   }
   if (actx.state === 'suspended') actx.resume();
+}
+function roomImpulse(sec) {
+  const n = Math.floor(actx.sampleRate * sec), b = actx.createBuffer(2, n, actx.sampleRate);
+  for (let c = 0; c < 2; c++) { const d = b.getChannelData(c); for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / n, 2.6); }
+  return b;
+}
+// an envelope that holds while the note is held (d seconds), then releases
+function held(t, peak, d, attack = 0.02, release = 0.2) {
+  const g = actx.createGain(), end = t + Math.max(attack + 0.02, d);
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(peak + 0.0001, t + attack);
+  g.gain.linearRampToValueAtTime(peak * 0.8 + 0.0001, end);
+  g.gain.exponentialRampToValueAtTime(0.0001, end + release);
+  g.connect(master);
+  return g;
 }
 function env(t, peak, decay, attack = 0.003) {
   const g = actx.createGain();
@@ -292,12 +374,13 @@ const VOICES = {
     osc('sine', f * 9.2, t, 0.05, out(t, 0.03 * v, 0.05));
   },
   // metal bar over a resonator, with the motor's tremolo
-  vibes: f => (t, v) => {
-    const g = out(t, 0.24 * v, 2.6), trem = actx.createGain(), lfo = actx.createOscillator(), depth = actx.createGain();
+  vibes: f => (t, v, d) => {
+    const ring = d ? clamp(d + 0.4, 0.6, 4) : 2.6;
+    const g = out(t, 0.24 * v, ring), trem = actx.createGain(), lfo = actx.createOscillator(), depth = actx.createGain();
     trem.gain.value = 0.75; depth.gain.value = 0.25; lfo.frequency.value = 5.5;
     lfo.connect(depth).connect(trem.gain); trem.connect(g);
-    lfo.start(t); lfo.stop(t + 2.7);
-    osc('sine', f, t, 2.6, trem);
+    lfo.start(t); lfo.stop(t + ring + 0.1);
+    osc('sine', f, t, ring, trem);
     osc('sine', f * 4, t, 0.35, out(t, 0.05 * v, 0.35));
   },
   // small steel bar: bright, long ring
@@ -312,23 +395,55 @@ const VOICES = {
     osc('sine', f * 2, t, 0.4, out(t, 0.05 * v, 0.4));
   },
   // bass string: sawtooth through a closing lowpass
-  bass: f => (t, v) => {
-    const lp = filt('lowpass', 2600, 2);
+  bass: f => (t, v, d) => {
+    const len = d ? clamp(d + 0.15, 0.3, 2.5) : 1.4, lp = filt('lowpass', 2600, 2);
     lp.frequency.setValueAtTime(2600, t);
     lp.frequency.exponentialRampToValueAtTime(f * 2.5, t + 0.35);
-    lp.connect(out(t, 0.32 * v, 1.4));
-    osc('sawtooth', f, t, 1.4, lp);
-    osc('sine', f, t, 1.2, out(t, 0.2 * v, 1.2));
+    lp.connect(out(t, 0.32 * v, len));
+    osc('sawtooth', f, t, len, lp);
+    osc('sine', f, t, len, out(t, 0.2 * v, len));
   },
   // brass pipe: two detuned saws, filter swells open then closes
-  horns: f => (t, v) => {
-    const lp = filt('lowpass', f * 1.5, 1.2);
+  horns: f => (t, v, d) => {
+    const len = d || 0.5, lp = filt('lowpass', f * 1.5, 1.2);
     lp.frequency.setValueAtTime(f * 1.5, t);
     lp.frequency.exponentialRampToValueAtTime(f * 6, t + 0.05);
-    lp.frequency.exponentialRampToValueAtTime(f * 2, t + 0.5);
-    lp.connect(out(t, 0.2 * v, 0.6, 0.03));
-    osc('sawtooth', f, t, 0.6, lp);
-    osc('sawtooth', f * 1.004, t, 0.6, lp);
+    lp.frequency.exponentialRampToValueAtTime(f * 2.5, t + Math.min(0.5, len));
+    lp.connect(held(t, 0.2 * v, len, 0.03, 0.15));
+    osc('sawtooth', f, t, len + 0.2, lp);
+    osc('sawtooth', f * 1.004, t, len + 0.2, lp);
+  },
+  // xylophone bar: short and bright
+  xylo: f => (t, v) => {
+    osc('sine', f, t, 0.35, out(t, 0.28 * v, 0.35));
+    osc('sine', f * 3, t, 0.08, out(t, 0.1 * v, 0.08));
+  },
+  // plucked coil: a bright pluck that bends into pitch and wobbles like a spring
+  springs: f => (t, v) => {
+    const o = actx.createOscillator(), lp = filt('lowpass', f * 7, 1.5), lfo = actx.createOscillator(), dep = actx.createGain();
+    o.type = 'triangle';
+    o.frequency.setValueAtTime(f * 1.06, t); o.frequency.exponentialRampToValueAtTime(f, t + 0.06);
+    lfo.frequency.value = 6; dep.gain.setValueAtTime(f * 0.02, t); dep.gain.exponentialRampToValueAtTime(0.0001, t + 1.2);
+    lfo.connect(dep).connect(o.frequency);
+    o.connect(lp).connect(out(t, 0.26 * v, 1.6));
+    o.start(t); o.stop(t + 1.65); lfo.start(t); lfo.stop(t + 1.65);
+  },
+  // struck bowl: inharmonic partials with a long ring
+  bells: f => (t, v) => {
+    for (const [m, a, len] of [[1, 0.2, 3], [2.4, 0.09, 1.6], [4.1, 0.05, 0.9], [6.8, 0.03, 0.4]]) osc('sine', f * m, t, len, out(t, a * v, len));
+  },
+  // pipe organ: stacked harmonics that hold while the note is held
+  organ: f => (t, v, d) => {
+    const len = d || 0.8, g = held(t, 0.12 * v, len, 0.05, 0.25);
+    for (const [m, a] of [[0.5, 0.5], [1, 1], [2, 0.6], [3, 0.3], [4, 0.25]]) { const gg = actx.createGain(); gg.gain.value = a; gg.connect(g); osc('sine', f * m, t, len + 0.3, gg); }
+  },
+  // laser: two detuned saws with vibrato, held
+  laser: f => (t, v, d) => {
+    const len = d || 0.6, lp = filt('lowpass', f * 8, 2), lfo = actx.createOscillator(), dep = actx.createGain();
+    lp.connect(held(t, 0.1 * v, len, 0.01, 0.2));
+    const o = osc('sawtooth', f, t, len + 0.25, lp); osc('sawtooth', f * 1.007, t, len + 0.25, lp);
+    lfo.frequency.value = 5.5; dep.gain.value = f * 0.006;
+    lfo.connect(dep).connect(o.frequency); lfo.start(t + 0.15); lfo.stop(t + len + 0.3);
   },
   drums: name => (t, v) => {
     switch (name) {
@@ -352,6 +467,58 @@ const VOICES = {
     }
   },
 };
+
+
+// ---------- sampled instruments (FluidR3 GM, CC BY 3.0), each loaded the first time it's needed ----------
+const SAMPLE_OF = {
+  marimba: 'marimba', vibes: 'vibraphone', glock: 'glockenspiel', harp: 'orchestral_harp', bass: 'acoustic_bass', horns: 'french_horn',
+  xylo: 'xylophone', springs: 'kalimba', bells: 'tubular_bells', organ: 'church_organ', laser: 'lead_2_sawtooth',
+};
+const SUSTAINED = new Set(['vibes', 'bass', 'horns', 'organ', 'laser']);   // these stop when the note is released
+const sampleBank = {};
+function loadSampleSet(kind) {
+  const name = SAMPLE_OF[kind];
+  if (!name || !actx || sampleBank[name]) return;
+  const set = sampleBank[name] = { state: 'loading', notes: [] };
+  fetch(`samples/${name}.json`)
+    .then(r => r.ok ? r.json() : Promise.reject(new Error(String(r.status))))
+    .then(obj => Promise.all(Object.entries(obj).map(([midi, b64]) => {
+      const bin = atob(b64), bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      return actx.decodeAudioData(bytes.buffer).then(buffer => ({ midi: +midi, buffer }));
+    })))
+    .then(list => { set.notes = list.sort((a, b) => a.midi - b.midi); set.state = 'ready'; })
+    .catch(() => { set.state = 'failed'; });   // the synth voice keeps playing this instrument
+}
+function preloadSamples() {
+  if (!FX.samples || !actx) return;
+  for (const st of stations) loadSampleSet(st.spec.kind);
+  if (current && current.parts) for (const pt of current.parts) loadSampleSet(backingKind(pt));
+}
+function samplePlay(kind, midi, t, vel, d) {
+  const set = sampleBank[SAMPLE_OF[kind]];
+  if (!set) { loadSampleSet(kind); return false; }
+  if (set.state !== 'ready' || !set.notes.length) return false;
+  let best = set.notes[0];
+  for (const s of set.notes) if (Math.abs(s.midi - midi) < Math.abs(best.midi - midi)) best = s;
+  const rate = Math.pow(2, (midi - best.midi) / 12), natural = best.buffer.duration / rate;
+  const end = d != null && SUSTAINED.has(kind) ? Math.min(natural, d + 0.3) : natural;
+  const src = actx.createBufferSource(), g = actx.createGain(), peak = 0.55 * (0.3 + 0.7 * vel);
+  src.buffer = best.buffer; src.playbackRate.value = rate;
+  g.gain.setValueAtTime(peak, t);
+  g.gain.setValueAtTime(peak, t + Math.max(0.03, end - 0.3));
+  g.gain.exponentialRampToValueAtTime(0.0001, t + end);
+  src.connect(g).connect(master); src.start(t); src.stop(t + end + 0.05);
+  return true;
+}
+// one note on one instrument kind: the recorded sample when it's loaded, otherwise the synth voice
+function playNote(kind, midi, hitAbs, vel, dur) {
+  if (!soundOn || !actx) return;
+  const t = actx.currentTime + Math.max(0, hitAbs - nowSec());
+  const d = FX.hold && dur ? dur : null;
+  if (FX.samples && samplePlay(kind, midi, t, vel, d)) return;
+  (VOICES[kind] || VOICES.marimba)(mtof(midi))(t, vel, d);
+}
 
 // ---------- instrument kinds ----------
 // Each kind builds one module in local coordinates: x runs low→high pitch, y is up,
@@ -388,9 +555,9 @@ function barRow(st, o) {
     bar.receiveShadow = true;
     if (o.resonator) cyl(st.group, 0.08, 0.08, o.resonator(i / (N - 1)), o.resMat, x, y - 0.12 - o.resonator(i / (N - 1)) / 2, 0, 10);
     const inst = {
-      update(dt, a) {
+      update(dt, a, h = 0) {
         bar.position.y = y - (dt >= 0 ? a * 0.05 * decay(dt, 7) * Math.abs(Math.sin(45 * dt)) : 0);
-        mat.emissiveIntensity = a * (metal ? 0.9 : 1.3) * decay(dt, o.glowDecay || 5);
+        mat.emissiveIntensity = a * (metal ? 0.9 : 1.3) * Math.max(decay(dt, o.glowDecay || 5), o.sustain ? 0.45 * h : 0);
       },
     };
     st.note(n, V(x, y + 0.045 + BALL_R, 0), V(0, 1, -0.35), inst, VOICES[st.spec.kind](mtof(n)), 0, ballBounce);
@@ -407,20 +574,307 @@ function stringLine(g, a, b, color) {
   g.add(new THREE.Line(geo, mat));
   const base = new THREE.Color(color), hot = new THREE.Color(0xffd9a8), z0 = a.z;
   return {
-    update(dt, a) {
-      const p = geo.attributes.position, disp = dt >= 0 ? a * 0.2 * decay(dt, 2.2) * Math.sin(2 * Math.PI * 9 * dt) : 0;
+    update(dt, a, h = 0) {
+      const p = geo.attributes.position, disp = dt >= 0 ? a * 0.2 * Math.max(decay(dt, 2.2), 0.4 * h) * Math.sin(2 * Math.PI * 9 * dt) : 0;
       for (let k = 0; k <= SEG; k++) p.array[k * 3 + 2] = z0 - disp * Math.sin(Math.PI * k / SEG);
       p.needsUpdate = true;
-      mat.color.copy(base).lerp(hot, Math.min(1, a * decay(dt, 3)));
+      mat.color.copy(base).lerp(hot, Math.min(1, a * Math.max(decay(dt, 3), 0.6 * h)));
     },
   };
 }
+
+// ---------- new instruments ----------
+// A station can also run its own mechanism instead of being struck by launched balls:
+// st.schedule(note, T, vel, dur) queues a note that must sound at time T, st.tick(now, dt) animates
+// the station, and st.lead says how many seconds ahead it needs to hear about a note.
+const foldNote = (n, lo, hi) => { while (n < lo) n += 12; while (n > hi) n -= 12; return n; };
+function registerInst(inst) { Object.assign(inst, { t0: -10, amp: 0, holdUntil: -10 }); insts.push(inst); return inst; }
+function hitInst(inst, T, vel, dur) { Object.assign(inst, { t0: T, amp: 0.35 + 0.65 * vel, holdUntil: T + (FX.hold ? dur || 0 : 0) }); }
+const pitchMats = {};
+
+// Marble run xylophone: marbles roll along a top rail, drop through a gate onto their bar exactly on
+// the note, hop into a return trough and ride a glass lift back up. Fast runs become a continuous roll.
+function buildMarbleRun(st) {
+  const lo = 60, hi = 96, N = hi - lo + 1, sp = 0.26, W = N * sp, g = st.group;
+  const SPEED = 4, BAR_Y = 0.95, MR = 0.055, RAIL_R = 0.025, TZ = -0.45, HOP = 0.32, ROLL = 2.4;
+  const xs = -W / 2 - 0.45, xe = W / 2 + 0.25;
+  const railY = x => 2.5 - 0.3 * (x - xs) / (xe - xs);          // top rail slopes gently toward the high end
+  const troughY = x => 0.42 + 0.14 * (x - xs) / (xe - xs);      // return trough slopes back toward the lift
+  const ride = y => y + RAIL_R + MR;
+  for (const z of [-0.28, 0.28]) box(g, W + 0.3, 0.05, 0.05, frameMat, 0, BAR_Y - 0.07, z);
+  for (const x of [-W / 2, W / 2]) for (const z of [-0.28, 0.28]) cyl(g, 0.03, 0.03, BAR_Y - 0.07, frameMat, x, (BAR_Y - 0.07) / 2, z, 8);
+  const rod = (a, b) => { const m = new THREE.Mesh(new THREE.TubeGeometry(new THREE.LineCurve3(a, b), 4, RAIL_R, 8), brassMat); m.castShadow = true; g.add(m); };
+  rod(V(xs, railY(xs), 0), V(xe, railY(xe), 0));
+  rod(V(xe, troughY(xe), TZ), V(xs, troughY(xs), TZ));
+  for (const x of [xs, 0, xe]) {
+    cyl(g, 0.022, 0.022, railY(x), frameMat, x, railY(x) / 2, 0, 8);
+    cyl(g, 0.022, 0.022, troughY(x), frameMat, x, troughY(x) / 2, TZ, 8);
+  }
+  const lift = new THREE.CatmullRomCurve3([V(xs, ride(troughY(xs)), TZ), V(xs - 0.25, 1.2, TZ * 0.7), V(xs - 0.3, 2.3, TZ * 0.3), V(xs, ride(railY(xs)), 0)]);
+  g.add(new THREE.Mesh(new THREE.TubeGeometry(lift, 40, 0.1, 12), new THREE.MeshPhysicalMaterial({ color: 0xcfe8ff, transparent: true, opacity: 0.18, roughness: 0.05, depthWrite: false })));
+  const bars = [];
+  for (let n = lo; n <= hi; n++) {
+    const i = n - lo, x = -W / 2 + sp * (i + 0.5), len = 0.55 - 0.25 * i / (N - 1);
+    const mat = stdMat({ color: SHARP.has(n % 12) ? 0xd9a066 : 0xc98f52, roughness: 0.45, emissive: 0xffb36b, emissiveIntensity: 0 });
+    const bar = box(g, 0.2, 0.06, len, mat, x, BAR_Y, 0);
+    const gate = box(g, 0.13, 0.012, 0.1, brassMat, x, railY(x) - 0.05, 0.07);
+    const inst = registerInst({ update(dt, a) {
+      bar.position.y = BAR_Y - (dt >= 0 ? a * 0.035 * decay(dt, 9) * Math.abs(Math.sin(50 * dt)) : 0);
+      mat.emissiveIntensity = a * 1.3 * decay(dt, 6);
+    } });
+    bars.push({ x, inst, gate, gateT: -10 });
+  }
+  const marbleGeo = new THREE.SphereGeometry(MR, 14, 10);
+  const marbles = [], tmpP = V(0, 0, 0), hopV = V(0, 0, 0);
+  st.lead = (xe - xs) / SPEED + 0.7;
+  st.schedule = (note, T, vel, dur) => {
+    const b = bars[note - lo];
+    const tf = Math.sqrt(2 * (ride(railY(b.x)) - (BAR_Y + 0.03 + MR)) / 9.81), tr = (b.x - xs) / SPEED;
+    const mat = pitchMats[note] || (pitchMats[note] = shared(stdMat({ color: pitchColor(note), metalness: 0.2, roughness: 0.1, emissive: pitchColor(note), emissiveIntensity: 0.25 })));
+    const mesh = new THREE.Mesh(marbleGeo, mat);
+    mesh.visible = false; mesh.castShadow = true; g.add(mesh);
+    marbles.push({ b, T, vel, dur, note, tDrop: T - tf, tStart: T - tf - tr, mesh, hit: false });
+    playNote('xylo', note, T, vel, dur);
+  };
+  st.tick = now => {
+    for (const b of bars) b.gate.rotation.x = 0.9 * decay(now - b.gateT, 7);
+    for (let k = marbles.length - 1; k >= 0; k--) {
+      const m = marbles[k], p = m.mesh.position;
+      if (now < m.tStart) { m.mesh.visible = false; continue; }
+      m.mesh.visible = true;
+      if (now < m.tDrop) { const x = xs + SPEED * (now - m.tStart); p.set(x, ride(railY(x)), 0); m.mesh.rotation.z = -(x - xs) / MR; continue; }
+      if (m.b.gateT < m.tDrop) m.b.gateT = m.tDrop;
+      if (now < m.T) { const s = now - m.tDrop; p.set(m.b.x, ride(railY(m.b.x)) - 4.905 * s * s, 0); continue; }
+      if (!m.hit) {
+        m.hit = true; hitCount++; st.heat += m.vel;
+        hitInst(m.b.inst, m.T, m.vel, m.dur);
+        flashAt(g.localToWorld(tmpP.set(m.b.x, BAR_Y + 0.2, 0.1)), pitchColor(m.note), m.vel, 5);
+      }
+      const s = now - m.T, from = V(m.b.x, BAR_Y + 0.03 + MR, 0), to = V(m.b.x - 0.05, ride(troughY(m.b.x)), TZ);
+      if (s < HOP) { solveV0(from, to, HOP, hopV); p.copy(from).addScaledVector(hopV, s).addScaledVector(G, 0.5 * s * s); continue; }
+      const xr = to.x - ROLL * (s - HOP);
+      if (xr > xs) { p.set(xr, ride(troughY(xr)), TZ); m.mesh.rotation.z = (xr - xs) / MR; continue; }
+      const u = (s - HOP - (to.x - xs) / ROLL) / 0.8;
+      if (u < 1) { p.copy(lift.getPointAt(u)); continue; }
+      g.remove(m.mesh); marbles.splice(k, 1);
+    }
+  };
+}
+
+// Spring harp: tall coil springs, struck by balls, that sway and bounce long after they're hit
+const helixCurve = new THREE.Curve();
+helixCurve.getPoint = (t, o = new THREE.Vector3()) => { const a = t * Math.PI * 2 * 11; return o.set(Math.cos(a) * 0.075, t, Math.sin(a) * 0.075); };
+let helixGeo = null, capGeo = null;
+function buildSpringHarp(st) {
+  const lo = 48, hi = 79, N = hi - lo + 1, sp = 0.3, W = N * sp, g = st.group, BASE = 0.3;
+  helixGeo = helixGeo || shared(new THREE.TubeGeometry(helixCurve, 280, 0.011, 5, false));
+  capGeo = capGeo || shared(new THREE.SphereGeometry(0.06, 12, 8));
+  box(g, W + 0.3, BASE, 0.5, darkMat, 0, BASE / 2, 0);
+  for (let n = lo; n <= hi; n++) {
+    const i = n - lo, x = -W / 2 + sp * (i + 0.5), H = 2.4 - 1.25 * i / (N - 1), w = 2 * Math.PI * (3.4 - 1.4 * i / (N - 1));
+    const mat = stdMat({ color: 0xd28a5a, metalness: 0.9, roughness: 0.3, emissive: 0xff9a5a, emissiveIntensity: 0 });
+    const pivot = new THREE.Group(); pivot.position.set(x, BASE, 0); g.add(pivot);
+    const coil = new THREE.Mesh(helixGeo, mat); coil.scale.y = H; coil.castShadow = true; pivot.add(coil);
+    const cap = new THREE.Mesh(capGeo, brassMat); cap.position.y = H; pivot.add(cap);
+    const inst = { update(dt, a, h = 0) {
+      const t = Math.max(dt, 0), s = a * Math.max(decay(dt, 1.5), 0.35 * h);
+      pivot.rotation.z = s * 0.16 * Math.sin(w * t);
+      pivot.rotation.x = s * 0.09 * Math.sin(w * t + 1.3);
+      coil.scale.y = H * (1 + a * 0.07 * decay(dt, 3) * Math.sin(2 * Math.PI * 5 * t));
+      cap.position.y = coil.scale.y;
+      mat.emissiveIntensity = a * 0.8 * Math.max(decay(dt, 4), 0.4 * h);
+    } };
+    st.note(n, V(x, BASE + H * 0.55, 0.075 + BALL_R), V(0, 0.25, 1), inst, null, 0, 0.4);
+  }
+}
+
+// Water bells: glass bowls of colored water; a ball lands in the water, rings the bowl and splashes
+function buildWaterBells(st) {
+  const lo = 60, hi = 84, N = hi - lo + 1, sp = 0.42, W = N * sp, g = st.group;
+  const glass = new THREE.MeshPhysicalMaterial({ color: 0xe8f6ff, transparent: true, opacity: 0.28, roughness: 0.04, clearcoat: 1, side: THREE.DoubleSide, depthWrite: false });
+  box(g, W + 0.2, 0.06, 0.5, darkMat, 0, 0.03, 0);
+  const drops = [], dropGeo = new THREE.SphereGeometry(0.022, 8, 6);
+  function splash(x, y, col, a) {
+    for (let k = 0; k < 7; k++) {
+      let d = drops.find(d => !d.live);
+      if (!d) {
+        if (drops.length >= 48) return;
+        d = { mesh: new THREE.Mesh(dropGeo, stdMat({ color: 0xffffff, transparent: true, opacity: 0.85, roughness: 0.05 })), v: V(0, 0, 0), live: false };
+        g.add(d.mesh); drops.push(d);
+      }
+      const ang = Math.random() * Math.PI * 2, out = (0.3 + Math.random() * 0.5) * a;
+      d.mesh.material.color.copy(col).lerp(new THREE.Color(0xffffff), 0.5);
+      d.mesh.position.set(x, y + 0.02, 0);
+      d.v.set(Math.cos(ang) * out, 1.2 + Math.random() * 1.3 * a, Math.sin(ang) * out);
+      d.live = true; d.mesh.visible = true;
+    }
+  }
+  for (let n = lo; n <= hi; n++) {
+    const i = n - lo, u = i / (N - 1), x = -W / 2 + sp * (i + 0.5), r = 0.19 - 0.07 * u, y0 = 0.75 + 0.25 * Math.sin(u * Math.PI);
+    cyl(g, 0.018, 0.018, y0, frameMat, x, y0 / 2, 0, 8);
+    const prof = [];
+    for (let k = 0; k <= 12; k++) { const p = k / 12 * Math.PI * 0.45; prof.push(new THREE.Vector2(Math.sin(p) * r * 1.3, (1 - Math.cos(p)) * r * 1.3)); }
+    const bowl = new THREE.Mesh(new THREE.LatheGeometry(prof, 36), glass);
+    bowl.position.set(x, y0, 0); g.add(bowl);
+    const wy = y0 + r * 0.32, wr = r * 1.05, col = pitchColor(n);
+    const wmat = stdMat({ color: col.clone().lerp(new THREE.Color(0xffffff), 0.35), transparent: true, opacity: 0.85, roughness: 0.08, metalness: 0.1, emissive: col, emissiveIntensity: 0.06 });
+    const wgeo = new THREE.RingGeometry(0.001, wr, 32, 6);
+    const water = new THREE.Mesh(wgeo, wmat);
+    water.rotation.x = -Math.PI / 2; water.position.set(x, wy, 0); g.add(water);
+    const pos = wgeo.attributes.position, rad = new Float32Array(pos.count);
+    for (let k = 0; k < pos.count; k++) rad[k] = Math.hypot(pos.getX(k), pos.getY(k)) / wr;
+    let still = true;
+    const inst = { splashT: -10, update(dt, a, h = 0) {
+      if (dt < 0 && !h) {
+        if (!still) { for (let k = 0; k < pos.count; k++) pos.setZ(k, 0); pos.needsUpdate = true; still = true; }
+        wmat.emissiveIntensity = 0.06; return;
+      }
+      if (this.splashT !== this.t0) { this.splashT = this.t0; splash(x, wy, col, a); }
+      const A = a * 0.03 * Math.max(decay(dt, 1.4), 0.3 * h);
+      for (let k = 0; k < pos.count; k++) pos.setZ(k, A * Math.sin(rad[k] * 16 - dt * 11) * (1 - rad[k] * 0.7));
+      pos.needsUpdate = true; still = false;
+      wmat.emissiveIntensity = 0.06 + a * 1.1 * Math.max(decay(dt, 2.2), 0.5 * h);
+    } };
+    st.note(n, V(x, wy + BALL_R, 0), V(0, 1, -0.25), inst, null, 0, 0.3);
+  }
+  st.tick = (now, dt) => {
+    for (const d of drops) if (d.live) {
+      d.v.y -= 9.81 * dt; d.mesh.position.addScaledVector(d.v, dt);
+      if (d.mesh.position.y < 0.05) { d.live = false; d.mesh.visible = false; }
+    }
+  };
+}
+
+// Bellows organ: a pallet opens under each pipe just before it speaks, the pipe glows while held and
+// puffs a smoke ring; the bellows fill ahead of a phrase and empty as the pipes play
+function buildOrgan(st) {
+  const lo = 36, hi = 84, N = hi - lo + 1, sp = 0.21, W = N * sp, g = st.group, CHEST = 0.85;
+  const wood = stdMat({ color: 0x5c3a22, roughness: 0.6 });
+  box(g, W + 0.3, 0.45, 0.7, wood, 0, CHEST - 0.225, 0);
+  box(g, W + 0.4, 0.06, 0.8, brassMat, 0, CHEST + 0.01, 0);
+  const pipes = [];
+  for (let n = lo; n <= hi; n++) {
+    const i = n - lo, u = i / (N - 1), x = -W / 2 + sp * (i + 0.5), H = 0.7 + 2.7 * Math.pow(1 - u, 1.4), r = 0.085 - 0.04 * u;
+    const mat = stdMat({ color: 0xdfe3e8, metalness: 0.9, roughness: 0.22, emissive: 0xfff1d6, emissiveIntensity: 0 });
+    cyl(g, r, r, H, mat, x, CHEST + H / 2, 0, 14);
+    box(g, r * 1.2, 0.07, 0.02, darkMat, x, CHEST + 0.28, r + 0.004);              // the pipe's mouth
+    const pallet = box(g, r * 1.6, 0.012, 0.09, wood, x, CHEST + 0.04, 0.4);       // its valve flap
+    pipes.push({ x, H, mat, pallet, glow: 0, target: 0, open: 0 });
+  }
+  const bellows = new THREE.Group(); bellows.position.set(0, 0, 0.78); g.add(bellows);
+  const leather = stdMat({ color: 0x7a2e2e, roughness: 0.7 });
+  box(bellows, 2.6, 0.05, 0.6, wood, 0, 0.03, 0);
+  const topB = box(bellows, 2.6, 0.05, 0.6, wood, 0, 0.4, 0);
+  const pleats = [];
+  for (let k = 0; k < 5; k++) pleats.push(box(bellows, 2.5 - (k % 2) * 0.12, 0.02, 0.56 - (k % 2) * 0.06, leather, 0, 0.1, 0));
+  const puffs = [], puffGeo = new THREE.TorusGeometry(0.08, 0.014, 8, 20);
+  let bh = 0.38, bv = 0;
+  const events = [], tmpP = V(0, 0, 0), warm = new THREE.Color(0xffe2b0);
+  st.lead = 0.35;
+  st.schedule = (note, T, vel, dur) => {
+    events.push({ p: pipes[note - lo], T, vel, dur: FX.hold ? Math.max(0.12, dur || 0.3) : 0.3, started: false });
+    playNote('organ', note, T, vel, dur);
+  };
+  st.tick = (now, dt) => {
+    for (const p of pipes) { p.target = 0; p.open = 0; }
+    let upcoming = 0, sounding = 0;
+    for (let k = events.length - 1; k >= 0; k--) {
+      const e = events[k], p = e.p, rel = now - e.T;
+      if (rel > e.dur + 0.6) { events.splice(k, 1); continue; }
+      if (rel > -0.5 && rel < 0) upcoming++;
+      if (rel >= -0.15 && rel < e.dur + 0.1) p.open = 1;
+      if (rel >= 0 && rel < e.dur) { sounding++; p.target = Math.max(p.target, 0.6 + 0.6 * e.vel); }
+      if (rel >= 0 && !e.started) {
+        e.started = true; hitCount++; st.heat += e.vel;
+        flashAt(g.localToWorld(tmpP.set(p.x, CHEST + p.H, 0.15)), warm, e.vel, 6);
+        if (puffs.length < 30) {
+          const mesh = new THREE.Mesh(puffGeo, new THREE.MeshBasicMaterial({ color: 0xfff3dd, transparent: true, opacity: 0.5, depthWrite: false }));
+          mesh.rotation.x = Math.PI / 2; mesh.position.set(p.x, CHEST + p.H + 0.05, 0); g.add(mesh);
+          puffs.push({ mesh, t0: now, y: CHEST + p.H + 0.05 });
+        }
+      }
+    }
+    for (const p of pipes) {
+      p.glow += (p.target - p.glow) * Math.min(1, dt * (p.target > p.glow ? 30 : 6));
+      p.mat.emissiveIntensity = p.glow * (0.9 + 0.1 * Math.sin(now * 37 + p.x * 9));
+      p.pallet.rotation.x += (-0.7 * p.open - p.pallet.rotation.x) * Math.min(1, dt * 18);
+    }
+    // the bellows fill before a phrase and empty while the pipes speak
+    const goal = clamp(0.38 + 0.05 * upcoming - 0.025 * sounding, 0.18, 0.6);
+    bv += (60 * (goal - bh) - 10 * bv) * dt; bh += bv * dt;
+    topB.position.y = 0.05 + bh;
+    pleats.forEach((pl, k) => pl.position.y = 0.05 + bh * (k + 1) / 6);
+    for (let k = puffs.length - 1; k >= 0; k--) {
+      const f = puffs[k], s = (now - f.t0) / 0.9;
+      if (s >= 1) { g.remove(f.mesh); f.mesh.material.dispose(); puffs.splice(k, 1); continue; }
+      f.mesh.position.y = f.y + s * 0.6; f.mesh.scale.setScalar(1 + s * 2.2); f.mesh.material.opacity = 0.5 * (1 - s);
+    }
+  };
+}
+
+// Laser lyre: each emitter charges up just before its note, then a beam snaps to the top bar,
+// trembles while the note is held and fades on release
+function buildLaserLyre(st) {
+  const lo = 48, hi = 84, N = hi - lo + 1, sp = 0.27, W = N * sp, g = st.group, Y0 = 0.7, Y1 = 3.45, L = Y1 - Y0;
+  box(g, W + 0.5, 0.3, 0.45, darkMat, 0, 0.45, 0);
+  box(g, W + 0.7, 0.12, 0.28, brassMat, 0, Y1 + 0.08, 0);
+  for (const s of [-1, 1]) {
+    const arm = new THREE.CatmullRomCurve3([V(s * (W / 2 + 0.25), 0.55, 0), V(s * (W / 2 + 0.75), 1.6, 0), V(s * (W / 2 + 0.55), 2.8, 0), V(s * (W / 2 + 0.3), Y1 + 0.08, 0)]);
+    const m = new THREE.Mesh(new THREE.TubeGeometry(arm, 40, 0.07, 10), brassMat); m.castShadow = true; g.add(m);
+  }
+  const coreGeo = new THREE.CylinderGeometry(0.016, 0.016, 1, 8, 1, true), haloGeo = new THREE.CylinderGeometry(0.06, 0.06, 1, 12, 1, true);
+  const beams = [];
+  for (let n = lo; n <= hi; n++) {
+    const i = n - lo, x = -W / 2 + sp * (i + 0.5), col = pitchColor(n);
+    cyl(g, 0.05, 0.06, 0.12, darkMat, x, Y0 - 0.06, 0, 12);
+    const lensMat = stdMat({ color: 0x111111, emissive: col, emissiveIntensity: 0.15, roughness: 0.2 });
+    cyl(g, 0.04, 0.04, 0.02, lensMat, x, Y0 + 0.01, 0, 12);
+    cyl(g, 0.045, 0.045, 0.05, darkMat, x, Y1 - 0.03, 0, 12);
+    const beamMat = (c, o) => new THREE.MeshBasicMaterial({ color: c, transparent: true, opacity: o, blending: THREE.AdditiveBlending, depthWrite: false });
+    const core = new THREE.Mesh(coreGeo, beamMat(col.clone().lerp(new THREE.Color(0xffffff), 0.5), 0));
+    const halo = new THREE.Mesh(haloGeo, beamMat(col, 0));
+    for (const m of [core, halo]) { m.position.set(x, Y0 + L / 2, 0); m.scale.y = L; m.visible = false; g.add(m); }
+    beams.push({ x, col, lensMat, core, halo, level: 0, on: 0, charge: 0 });
+  }
+  const events = [], tmpP = V(0, 0, 0);
+  st.lead = 0.35;
+  st.schedule = (note, T, vel, dur) => {
+    events.push({ b: beams[note - lo], T, vel, dur: FX.hold ? Math.max(0.1, dur || 0.3) : 0.22, started: false });
+    playNote('laser', note, T, vel, dur);
+  };
+  st.tick = (now, dt) => {
+    for (const b of beams) { b.on = 0; b.charge = 0; }
+    for (let k = events.length - 1; k >= 0; k--) {
+      const e = events[k], b = e.b, rel = now - e.T;
+      if (rel > e.dur + 0.4) { events.splice(k, 1); continue; }
+      if (rel < 0 && rel > -0.28) b.charge = Math.max(b.charge, 1 + rel / 0.28);
+      if (rel >= 0 && rel < e.dur) b.on = Math.max(b.on, 0.55 + 0.45 * e.vel);
+      if (rel >= 0 && !e.started) {
+        e.started = true; hitCount++; st.heat += e.vel;
+        flashAt(g.localToWorld(tmpP.set(b.x, Y0 + L * 0.5, 0.2)), b.col, e.vel, 7, 6);
+      }
+    }
+    for (const b of beams) {
+      b.level += (b.on - b.level) * Math.min(1, dt * (b.on > b.level ? 60 : 12));
+      const lit = b.level > 0.01;
+      b.core.visible = b.halo.visible = lit;
+      if (lit) {
+        const tremble = 1 + 0.18 * Math.sin(now * 53 + b.x * 7) + 0.1 * Math.sin(now * 91 + b.x * 3);
+        b.core.material.opacity = Math.min(1, b.level * 1.1);
+        b.halo.material.opacity = b.level * 0.32 * tremble;
+        b.halo.scale.x = b.halo.scale.z = tremble;
+      }
+      b.lensMat.emissiveIntensity = 0.15 + 2.5 * b.charge + 1.5 * b.level;
+    }
+  };
+}
+
 
 const KINDS = {
   marimba: { label: 'Marimba', lo: 48, hi: 84, width: 37 * 0.32, ball: 0xe8b07a,
     build: st => barRow(st, { lo: 48, hi: 84, sp: 0.32, y: 1.0, len0: 1.3, len1: 0.7, width: 0.27, color: 0x6e3423, sharpColor: 0x9a5536, glow: 0xff8a3d, ballBounce: 0.5 }) },
   vibes: { label: 'Vibraphone', lo: 53, hi: 89, width: 37 * 0.3, ball: 0xc8dcf0,
-    build: st => barRow(st, { lo: 53, hi: 89, sp: 0.3, y: 1.15, len0: 1.1, len1: 0.6, width: 0.25, color: 0xbfc5cf, sharpColor: 0x9aa2ae, glow: 0x8fd0ff, metal: true, glowDecay: 2.5, ballBounce: 0.55,
+    build: st => barRow(st, { lo: 53, hi: 89, sp: 0.3, y: 1.15, len0: 1.1, len1: 0.6, width: 0.25, color: 0xbfc5cf, sharpColor: 0x9aa2ae, glow: 0x8fd0ff, metal: true, glowDecay: 2.5, ballBounce: 0.55, sustain: true,
       resonator: u => 0.85 - 0.6 * u, resMat: brassMat }) },
   glock: { label: 'Glockenspiel', lo: 72, hi: 103, width: 32 * 0.22, ball: 0xf4f4f4,
     build: st => {
@@ -469,9 +923,9 @@ const KINDS = {
         const pad = cyl(st.group, 0.09, 0.09, 0.04, darkMat, x, 1.0, 0.12, 12);
         pad.rotation.x = Math.PI / 2;
         const inst = {
-          update(dt, a) {
-            bell.scale.setScalar(1 + a * 0.35 * decay(dt, 6));
-            mat.emissiveIntensity = a * 0.7 * decay(dt, 5);
+          update(dt, a, h = 0) {
+            bell.scale.setScalar(1 + a * 0.35 * Math.max(decay(dt, 6), 0.45 * h));
+            mat.emissiveIntensity = a * 0.7 * Math.max(decay(dt, 5), 0.55 * h * (0.9 + 0.1 * Math.sin(dt * 31)));
           },
         };
         st.note(n, V(x, 1.0, 0.14 + BALL_R), V(0, 0.2, 1), inst, VOICES.horns(mtof(n)), 0, 0.35);
@@ -500,8 +954,13 @@ const KINDS = {
         st.note(d.name, V(x, top + BALL_R, z), V(0.1, 1, 0.15), inst, VOICES.drums(d.name), d.r * 0.5, d.kind === 'drum' ? 0.55 : 0.4);
       }
     } },
+  springs: { label: 'Spring harp', lo: 48, hi: 79, width: 32 * 0.3, ball: 0xe39a6a, labelY: 3.2, build: buildSpringHarp },
+  xylo: { label: 'Marble run', lo: 60, hi: 96, width: 37 * 0.26 + 1.2, ball: 0x9fe0ff, labelY: 3.3, selfDriven: true, build: buildMarbleRun },
+  bells: { label: 'Water bells', lo: 60, hi: 84, width: 25 * 0.42, ball: 0x8fd8ff, labelY: 2.2, build: buildWaterBells },
+  organ: { label: 'Bellows organ', lo: 36, hi: 84, width: 49 * 0.21 + 0.4, ball: 0xe8e3d6, labelY: 4.6, selfDriven: true, build: buildOrgan },
+  laser: { label: 'Laser lyre', lo: 48, hi: 84, width: 37 * 0.27 + 1.6, ball: 0xff5fd2, labelY: 4.1, selfDriven: true, build: buildLaserLyre },
 };
-const KIND_ORDER = ['bass', 'harp', 'marimba', 'vibes', 'horns', 'glock', 'drums'];
+const KIND_ORDER = ['bass', 'harp', 'springs', 'marimba', 'xylo', 'vibes', 'bells', 'horns', 'organ', 'laser', 'glock', 'drums'];
 const ballMats = {};
 for (const k in KINDS) ballMats[k] = shared(stdMat({ color: KINDS[k].ball, metalness: 0.5, roughness: 0.28 }));
 
@@ -509,10 +968,11 @@ for (const k in KINDS) ballMats[k] = shared(stdMat({ color: KINDS[k].ball, metal
 // They stand in one full circle around the launcher, evenly spaced; the circle grows
 // with the number of instruments, and tall and low ones alternate so the view stays open.
 const MIN_R = 9, MIN_GAP = 1.5, MAX_STATIONS = 10;
-const TALL = new Set(['bass', 'harp', 'horns']);
+const TALL = new Set(['bass', 'harp', 'horns', 'springs', 'organ', 'laser']);
 const TUBE_R = 1.5, TUBE_DY = 0.22;
 
 let stations = [], stationById = {}, layoutObjs = [], insts = [], maxTau = 1.2;
+let selfLead = 0, layoutR = 9;   // the longest lead a self-driven station needs, and the ring radius
 
 function disposeTree(o) {
   o.traverse(c => {
@@ -523,9 +983,40 @@ function disposeTree(o) {
 function clearLayout() {
   clearBalls();
   for (const o of layoutObjs) { pipeWorld.remove(o); disposeTree(o); }
-  layoutObjs = []; stations = []; stationById = {}; insts = []; maxTau = 0;
+  layoutObjs = []; stations = []; stationById = {}; insts = []; maxTau = 0; selfLead = 0;
 }
 const addObj = o => { pipeWorld.add(o); layoutObjs.push(o); return o; };
+
+// ---------- ball returns: a catcher behind each struck station and a rail back to the launcher ----------
+const railMat = shared(stdMat({ color: 0x8a95a8, metalness: 0.9, roughness: 0.25 }));
+const funnelMat = shared(stdMat({ color: 0x55607a, metalness: 0.8, roughness: 0.35, side: THREE.DoubleSide }));
+const polar = (a, r, y) => V(r * Math.cos(a), y, r * Math.sin(a));
+function buildReturn(st, a, R, edgeA) {
+  const mouth = polar(a, R + 1.35, 1.05);
+  const funnel = new THREE.Mesh(new THREE.CylinderGeometry(0.42, 0.1, 0.5, 24, 1, true), funnelMat);
+  funnel.position.copy(mouth).add(V(0, -0.25, 0));
+  const stand = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.03, 0.55, 8), railMat);
+  stand.position.copy(mouth).setY(0.27);
+  // out behind the station, around through the gap beside it, and in along the floor to the tower
+  const curve = new THREE.CatmullRomCurve3([polar(a, R + 1.35, 0.55), polar(a + edgeA * 0.5, R + 1.6, 0.42), polar(a + edgeA, R + 0.5, 0.3), polar(a + edgeA, R * 0.6, 0.22), polar(a + edgeA * 0.8, TUBE_R + 0.5, 0.16)]);
+  const rail = new THREE.Mesh(new THREE.TubeGeometry(curve, 120, 0.03, 6, false), railMat);
+  const objs = [funnel, stand, rail];
+  for (const o of objs) { o.castShadow = true; o.visible = FX.returns; addObj(o); }
+  st.ret = { mouth, curve, len: curve.getLength(), objs };
+}
+const DRUM_LIGHT = { kick: 0xff5577, snare: 0xffffff, tomLo: 0xff9944, tomHi: 0xffbb55, hat: 0xffe9a0, hatOpen: 0xffe9a0, crash: 0xffd27a, ride: 0xffc060 };
+// a ball after impact: hop into the catcher, drop through it, roll the rail to the tower and vanish inside
+function rideReturn(b, now) {
+  const ret = b.route.st.ret, p = b.mesh.position, s = now - b.hit;
+  if (s < b.hopT) { p.copy(b.P).addScaledVector(b.hv, s).addScaledVector(G, 0.5 * s * s); return false; }
+  const s2 = s - b.hopT;
+  if (s2 < 0.2) { p.lerpVectors(ret.mouth, ret.curve.getPointAt(0).add(V(0, BALL_R + 0.03, 0)), s2 / 0.2); return false; }
+  const s3 = s2 - 0.2, dist = s3 * (1.6 + 0.9 * s3), u = dist / ret.len;
+  if (u < 1) { p.copy(ret.curve.getPointAt(u)); p.y += BALL_R + 0.03; b.mesh.rotation.x = -dist / BALL_R; return false; }
+  const k = 1 - (dist - ret.len) / 0.4;   // shrinks as it rolls into the tower
+  b.mesh.scale.setScalar(Math.max(0, k));
+  return k <= 0;
+}
 
 function labelSprite(text) {
   const c = document.createElement('canvas'); c.width = 512; c.height = 96;
@@ -541,17 +1032,18 @@ function labelSprite(text) {
   return s;
 }
 
-function buildStation(spec, label, angle, R, baseY, ringIdx) {
+function buildStation(spec, label, angle, R, baseY, ringIdx, edgeA = 0.2) {
   const kind = KINDS[spec.kind];
   const group = new THREE.Group();
   group.position.set(R * Math.cos(angle), baseY, R * Math.sin(angle));
   group.lookAt(0, baseY, 0);
   addObj(group);
-  const st = { spec, kind, group, routes: {}, pending: [] };
+  const st = { spec, kind, group, routes: {}, pending: [], angle, R, heat: 0 };
   st.note = (key, local, normal, inst, voice, jitter = 0, restitution = 0.5) => st.pending.push({ key, local, normal, inst, voice, jitter, restitution });
   kind.build(st);
+  if (st.lead) selfLead = Math.max(selfLead, st.lead);
   const sprite = labelSprite(label);
-  const top = spec.kind === 'harp' || spec.kind === 'bass' ? 5.6 : spec.kind === 'horns' ? 3.9 : 3.1;
+  const top = kind.labelY || (spec.kind === 'harp' || spec.kind === 'bass' ? 5.6 : spec.kind === 'horns' ? 3.9 : 3.1);
   sprite.position.set(0, top, 0);
   group.add(sprite);
   group.updateMatrixWorld(true);
@@ -570,6 +1062,7 @@ function buildStation(spec, label, angle, R, baseY, ringIdx) {
     st.routes[p.key] = makeRoute(st, p, base, target, normal);
   });
   st.towerTop = band + rows * TUBE_DY + 0.3;
+  if (!kind.selfDriven) buildReturn(st, angle, R, edgeA);
   delete st.pending;
   return st;
 }
@@ -587,9 +1080,12 @@ function makeRoute(st, p, base, target, normal) {
   tube.position.copy(base).addScaledVector(dir, TUBE_LEN / 2);
   addObj(tube);
   insts.push(p.inst);
-  p.inst.t0 = -10; p.inst.amp = 0;
+  p.inst.t0 = -10; p.inst.amp = 0; p.inst.holdUntil = -10;
   maxTau = Math.max(maxTau, tau);
-  return { inst: p.inst, voice: p.voice, jitter: p.jitter, restitution: p.restitution, target, normal, mouth, dir, tau, tube, rest: tube.position.clone(), fired: -10, ballMat: ballMats[st.spec.kind] };
+  const kind = st.spec.kind, key = p.key;
+  const play = typeof key === 'number' ? (h, v, d) => playNote(kind, key, h, v, d) : (h, v) => playVoice(VOICES.drums(key), h, v);
+  const color = typeof key === 'number' ? pitchColor(key) : new THREE.Color(DRUM_LIGHT[key] || 0xffffff);
+  return { st, inst: p.inst, play, color, jitter: p.jitter, restitution: p.restitution, target, normal, mouth, dir, tau, tube, rest: tube.position.clone(), fired: -10, ballMat: ballMats[kind] };
 }
 
 function stationLabel(spec, specs) {
@@ -606,12 +1102,13 @@ function buildLayout(specs) {
   const widths = order.map(s => KINDS[s.kind].width), sumW = widths.reduce((a, b) => a + b, 0);
   const R = Math.max(MIN_R, (sumW + order.length * MIN_GAP) / (2 * Math.PI));
   const gap = order.length ? (2 * Math.PI * R - sumW) / order.length : 0;
+  layoutR = R;
   let towerTop = 3.3, pos = 0;
   order.forEach((s, i) => {
     // first station centered straight ahead (+z, angle 90°), the rest going around evenly
     const a = Math.PI / 2 + (pos - widths[0] / 2 + widths[i] / 2) / R;
     pos += widths[i] + gap;
-    const st = buildStation(s, stationLabel(s, specs), a, R, 0, 0);
+    const st = buildStation(s, stationLabel(s, specs), a, R, 0, 0, (widths[i] / 2 + gap / 2) / R);
     stations.push(st); stationById[s.id] = st;
     towerTop = Math.max(towerTop, st.towerTop);
   });
@@ -632,21 +1129,23 @@ function buildLayout(specs) {
   PIPE_FOG.far = orbit.r * 4;
   Object.assign(sun.shadow.camera, { left: -outer - 2, right: outer + 2, top: outer + 2, bottom: -outer - 2, near: 1, far: 80 });
   sun.shadow.camera.updateProjectionMatrix();
+  preloadSamples();
 }
 
 function routeIn(st, note) {
   if (st.spec.kind === 'drums') return st.routes[drumMap[note] || DRUMS[note % DRUMS.length].name];
-  const { lo, hi } = st.kind;
-  while (note < lo) note += 12;
-  while (note > hi) note -= 12;
-  return st.routes[note];
+  return st.routes[foldNote(note, st.kind.lo, st.kind.hi)];
+}
+// a note on a station: self-driven ones run their own mechanism, the rest get a ball
+function playOnStation(st, note, hitAbs, vel, dur) {
+  if (st.schedule) st.schedule(foldNote(note, st.kind.lo, st.kind.hi), hitAbs, vel, dur);
+  else spawn(routeIn(st, note), hitAbs, vel, dur);
 }
 // live input has no part list, so pick a station by channel and register
-function liveRoute(note, ch) {
+function liveStation(note, ch) {
   const pick = kinds => stations.find(s => kinds.includes(s.spec.kind));
-  const st = ch === 9 ? pick(['drums'])
-    : (note < 48 && pick(['bass', 'harp'])) || pick(['marimba', 'vibes', 'harp', 'glock', 'horns', 'bass']);
-  return st ? routeIn(st, note) : null;
+  return ch === 9 ? pick(['drums'])
+    : (note < 48 && pick(['bass', 'harp', 'springs', 'organ'])) || pick(['marimba', 'xylo', 'vibes', 'harp', 'springs', 'glock', 'bells', 'horns', 'organ', 'laser', 'bass']);
 }
 
 // ---------- balls ----------
@@ -655,19 +1154,15 @@ const MAX_BALLS = 900;
 let hitCount = 0;
 const tmp = V(0, 0, 0);
 
-function playAt(route, hitAbs, vel) {
-  if (!soundOn || !actx) return;
-  route.voice(actx.currentTime + Math.max(0, hitAbs - nowSec()), vel);
-}
-function spawn(route, hitAbs, vel) {
+function spawn(route, hitAbs, vel, dur = 0.3) {
   if (!route || balls.length >= MAX_BALLS) return;
   const P = route.target.clone();
   if (route.jitter) { P.x += (Math.random() - 0.5) * route.jitter; P.z += (Math.random() - 0.5) * route.jitter; }
   const v0 = solveV0(route.mouth, P, route.tau, V(0, 0, 0));
   const mesh = new THREE.Mesh(ballGeo, route.ballMat);
   mesh.castShadow = true; mesh.visible = false; pipeWorld.add(mesh);
-  balls.push({ route, P, v0, launch: hitAbs - route.tau, hit: hitAbs, vel, mesh, phase: 0, launched: false, v: null, bounces: 0, fade: 0 });
-  playAt(route, hitAbs, vel);
+  balls.push({ route, P, v0, launch: hitAbs - route.tau, hit: hitAbs, vel, dur, mesh, phase: 0, launched: false, v: null, bounces: 0, fade: 0 });
+  route.play(hitAbs, vel, dur);
 }
 function removeBall(i) { pipeWorld.remove(balls[i].mesh); balls.splice(i, 1); }
 function clearBalls() { for (let i = balls.length - 1; i >= 0; i--) removeBall(i); }
@@ -692,9 +1187,16 @@ function updateBalls(now, dt) {
         b.mesh.position.copy(r.mouth).addScaledVector(b.v0, s).addScaledVector(G, 0.5 * s * s);
         continue;
       }
-      // impact: velocity at arrival, reflected about the instrument's surface normal
-      b.phase = 1; hitCount++;
-      r.inst.t0 = b.hit; r.inst.amp = 0.35 + 0.65 * b.vel;
+      // impact: the instrument rings and a light flashes; the ball hops to its catcher or bounces free
+      hitCount++; r.st.heat += b.vel;
+      hitInst(r.inst, b.hit, b.vel, b.dur);
+      flashAt(tmp.copy(b.P).addScaledVector(r.normal, 0.3), r.color, b.vel, 6);
+      if (FX.returns && r.st.ret) {
+        b.phase = 2; b.hopT = 0.45 + 0.04 * b.P.distanceTo(r.st.ret.mouth);
+        b.hv = solveV0(b.P, r.st.ret.mouth, b.hopT, V(0, 0, 0));
+        continue;
+      }
+      b.phase = 1;
       const vin = tmp.copy(b.v0).addScaledVector(G, r.tau);
       b.v = vin.clone().addScaledVector(r.normal, -(1 + r.restitution) * vin.dot(r.normal));
       b.v.x += (Math.random() - 0.5) * 0.6; b.v.z += (Math.random() - 0.5) * 0.6;
@@ -702,6 +1204,7 @@ function updateBalls(now, dt) {
       stepFree(b, now - b.hit);
       continue;
     }
+    if (b.phase >= 2) { if (rideReturn(b, now)) removeBall(i); continue; }
     stepFree(b, dt);
     if (b.bounces >= 2 || now - b.hit > 4) {
       b.fade += dt;
@@ -711,10 +1214,15 @@ function updateBalls(now, dt) {
     }
   }
 }
+// 1 while a held note sounds, easing to 0 over 0.3 s after release; always 0 with held notes off
+function holdLevel(it, now) {
+  if (!FX.hold || now < it.t0) return 0;
+  return now < it.holdUntil ? 1 : Math.max(0, 1 - (now - it.holdUntil) / 0.3);
+}
 function updateInstruments(now) {
   for (const it of insts) {
-    const dt = now - it.t0;
-    it.update(dt >= 0 && dt < 4 ? dt : -1, dt >= 0 && dt < 4 ? it.amp : 0);
+    const dt = now - it.t0, h = holdLevel(it, now), live = dt >= 0 && (dt < 4 || h > 0);
+    it.update(live ? dt : -1, live ? it.amp : 0, live ? h : 0);
   }
 }
 function updateTubes(now) {
@@ -761,16 +1269,24 @@ function parseMidi(buf) {
         const hi = st & 0xF0, ch = st & 15, a = u8(), b = (hi === 0xC0 || hi === 0xD0) ? 0 : u8();
         if (hi === 0xC0 && !(ch in programs)) programs[ch] = a;
         if (hi === 0x90 && b > 0) events.push({ tick, note: a, vel: b, ch, part: track + ':' + ch });
+        else if (hi === 0x80 || hi === 0x90) events.push({ tick, off: true, note: a, part: track + ':' + ch });
       }
     }
     p = end;
   }
-  events.sort((x, y) => x.tick - y.tick || (y.tempo ? 1 : 0) - (x.tempo ? 1 : 0));
+  // same tick: tempo changes first, then note-offs, then note-ons (so a repeated note ends before it restarts)
+  const rank = e => e.tempo ? 0 : e.off ? 1 : 2;
+  events.sort((x, y) => x.tick - y.tick || rank(x) - rank(y));
   let us = 500000, lastTick = 0, sec = 0;
-  const notes = [];
+  const notes = [], open = {};
   for (const e of events) {
     sec += (e.tick - lastTick) * us / 1e6 / div; lastTick = e.tick;
-    if (e.tempo) us = e.tempo; else notes.push({ time: sec, note: e.note, vel: e.vel, ch: e.ch, part: e.part });
+    if (e.tempo) { us = e.tempo; continue; }
+    const key = e.part + ':' + e.note;
+    if (e.off) { const n = open[key] && open[key].shift(); if (n) n.dur = Math.max(0.03, sec - n.time); continue; }
+    const n = { time: sec, note: e.note, vel: e.vel, ch: e.ch, part: e.part, dur: 0.5 };
+    notes.push(n);
+    (open[key] = open[key] || []).push(n);
   }
   return { notes, parts: buildParts(notes, key => trackNames[+key.split(':')[0]] || 'Track ' + (+key.split(':')[0] + 1), programs) };
 }
@@ -791,24 +1307,30 @@ function guessKind(pt) {
   if (pt.ch === 9) return 'drums';
   const p = pt.program;
   if (p >= 32 && p <= 39) return 'bass';
-  if (pt.sum / pt.count < 50 && pt.hi < 62) return 'bass';          // sits low: the bass line, whatever its patch
+  // a low part on a piano, guitar or unnamed patch is the bass line
+  if ((p == null || p <= 7 || (p >= 24 && p <= 31)) && pt.sum / pt.count < 50 && pt.hi < 62) return 'bass';
   if (p == null) return 'marimba';
   if (p <= 7) return 'harp';                                         // pianos: wide range, both hands
-  if (p === 9 || p === 10 || p === 8) return 'glock';               // celesta, glockenspiel, music box
-  if (p === 11 || p === 14) return 'vibes';                         // vibraphone, tubular bells
-  if (p <= 15) return 'marimba';                                     // marimba, xylophone, dulcimer
-  if (p <= 23) return 'horns';                                       // organs
-  if (p <= 31) return 'harp';                                        // guitars
+  if (p <= 10) return 'glock';                                       // celesta, glockenspiel, music box
+  if (p === 11) return 'vibes';                                      // vibraphone
+  if (p === 12) return 'marimba';
+  if (p === 13) return 'xylo';                                       // xylophone: the marble run
+  if (p === 14) return 'bells';                                      // tubular bells
+  if (p === 15) return 'springs';                                    // dulcimer
+  if (p <= 23) return 'organ';                                       // organs and accordions
+  if (p <= 31) return 'springs';                                     // guitars: plucked springs
   if (p === 45 || p === 46) return 'harp';                           // pizzicato, harp
   if (p === 47) return 'drums';                                      // timpani
-  if (p >= 52 && p <= 54) return 'off';                              // choirs: held chords, not hits
+  if (p >= 52 && p <= 54) return 'organ';                            // choirs: held chords
   if (p <= 55) return 'vibes';                                       // strings and ensembles
   if (p <= 71) return 'horns';                                       // brass and reeds
   if (p <= 79) return 'glock';                                       // flutes and pipes
-  if (p <= 87) return 'marimba';                                     // synth leads
-  if (p <= 103) return 'off';                                        // pads and FX
-  if (p <= 111) return 'marimba';                                    // ethnic plucks
-  if (p === 114) return 'marimba';                                   // steel drums
+  if (p <= 95) return 'laser';                                       // synth leads and pads: beams
+  if (p <= 103) return 'off';                                        // sound effects
+  if (p <= 108) return 'springs';                                    // sitar, banjo, shamisen, koto, kalimba
+  if (p === 109) return 'organ';                                     // bagpipe
+  if (p <= 111) return 'horns';                                      // fiddle, shanai
+  if (p <= 114) return 'bells';                                      // tinkle bell, agogo, steel drums
   if (p <= 119) return 'drums';                                      // percussive
   return 'off';
 }
@@ -830,6 +1352,11 @@ const FALLBACK = {
   harp: ['marimba', 'vibes', 'glock'],
   bass: ['harp', 'marimba'],
   horns: ['vibes', 'marimba', 'harp'],
+  springs: ['harp', 'marimba', 'vibes'],
+  xylo: ['marimba', 'glock', 'vibes'],
+  bells: ['vibes', 'glock', 'marimba'],
+  organ: ['horns', 'vibes', 'laser'],
+  laser: ['vibes', 'horns', 'organ', 'harp'],
   drums: [],
 };
 let enabledKinds = new Set(KIND_ORDER);
@@ -875,20 +1402,25 @@ function makeEntry(name, notes, parts) {
 }
 
 // ---------- demo song (original groove: Am–F–C–G) ----------
+// ten parts, one for each kind of instrument, with note lengths so held notes have something to hold
 function demoEntry() {
   const b = 60 / 104, notes = [];
-  const add = (beat, note, vel, ch) => notes.push({ time: beat * b, note, vel, ch, part: 'demo:' + ch });
+  const add = (beat, note, vel, ch, len = 0.4) => notes.push({ time: beat * b, note, vel, ch, part: 'demo:' + ch, dur: len * b });
   const chords = [[69, 72, 76], [65, 69, 72], [72, 76, 79], [67, 71, 74]];
   const roots = [45, 41, 36, 43];
   for (let bar = 0; bar < 16; bar++) {
     const c = bar % 4, B = bar * 4, ch = chords[c], root = roots[c];
     const tones = [ch[0], ch[1], ch[2], ch[0] + 12];
-    [0, 1, 2, 3, 2, 1, 0, 1].forEach((k, j) => add(B + j * 0.5, tones[k], j % 2 ? 76 : 100, 0));
+    [0, 1, 2, 3, 2, 1, 0, 1].forEach((k, j) => add(B + j * 0.5, tones[k], j % 2 ? 76 : 100, 0, 0.45));
     const fifth = root + 7 > 47 ? root - 5 : root + 7;
-    add(B, root, 115, 1); add(B + 1.5, root, 80, 1); add(B + 2, fifth, 95, 1); add(B + 3.5, root, 85, 1);
-    ch.forEach(n => { add(B, n - 12, 70, 2); add(B + 2.5, n - 12, 55, 2); });
-    if (bar % 2 === 1) [[1, 2], [1.5, 1], [3, 0]].forEach(([t, k]) => add(B + t, ch[k] + 12, 90, 3));
-    if (bar >= 8) { add(B, ch[0] - 12, 100, 4); add(B, ch[2] - 12, 100, 4); add(B + 1.5, ch[1] - 12, 90, 4); }
+    add(B, root, 115, 1, 1.3); add(B + 1.5, root, 80, 1, 0.45); add(B + 2, fifth, 95, 1, 1.3); add(B + 3.5, root, 85, 1, 0.45);
+    ch.forEach(n => { add(B, n - 12, 70, 2, 2.3); add(B + 2.5, n - 12, 55, 2, 1.4); });
+    if (bar % 2 === 1) [[1, 2], [1.5, 1], [3, 0]].forEach(([t, k]) => add(B + t, ch[k] + 12, 90, 3, 1));
+    if (bar >= 8) { add(B, ch[0] - 12, 100, 4, 0.5); add(B, ch[2] - 12, 100, 4, 0.5); add(B + 1.5, ch[1] - 12, 90, 4, 0.5); }
+    if (bar >= 8) ch.forEach(n => add(B, n - 24, 75, 5, 3.9));                                          // organ holds each chord
+    if (bar >= 12) [[0, 2, 2], [2, 1, 1], [3, 0, 1]].forEach(([t, k, l]) => add(B + t, ch[k] + 12, 95, 6, l));  // laser lead
+    if (bar % 4 === 3) for (let j = 0; j < 8; j++) add(B + 3 + j * 0.125, tones[j % 4] + (j >= 4 ? 12 : 0), 80 + j * 4, 7, 0.12);  // marble run
+    if (bar >= 4 && bar < 12) [[0.5, 1], [1.5, 0], [2.5, 2], [3.5, 1]].forEach(([t, k]) => add(B + t, ch[k], 70, 8, 0.4));  // spring plucks
     add(B, 36, 120, 9); add(B + 2.5, 36, 90, 9); add(B + 1, 38, 110, 9);
     for (let j = 0; j < 8; j++) add(B + j * 0.5, j === 7 ? 46 : 42, j % 2 ? 60 : 85, 9);
     if (bar % 4 === 0) add(B, 49, 115, 9);
@@ -897,8 +1429,8 @@ function demoEntry() {
     else add(B + 3, 38, 115, 9);
   }
   notes.sort((x, y) => x.time - y.time);
-  const names = { 0: 'Marimba arpeggio', 1: 'Bass line', 2: 'Vibes chords', 3: 'Glock sparkle', 4: 'Horn stabs', 9: 'Drums' };
-  return makeEntry('Demo groove', notes, buildParts(notes, k => names[k.split(':')[1]], { 0: 12, 1: 33, 2: 11, 3: 9, 4: 61 }));
+  const names = { 0: 'Marimba arpeggio', 1: 'Bass line', 2: 'Vibes chords', 3: 'Water bell sparkle', 4: 'Horn stabs', 5: 'Organ chords', 6: 'Laser lead', 7: 'Marble runs', 8: 'Spring plucks', 9: 'Drums' };
+  return makeEntry('Demo groove', notes, buildParts(notes, k => names[k.split(':')[1]], { 0: 12, 1: 33, 2: 11, 3: 14, 4: 61, 5: 19, 6: 81, 7: 13, 8: 24 }));
 }
 const DEMO = demoEntry();
 
@@ -912,8 +1444,8 @@ function playVoice(fn, hitAbs, vel) {
 
 const pipeMachine = {
   id: 'pipe', label: 'Pipe Rig', blurb: 'Each note fires a ball early enough to land exactly on the beat. Drag to orbit, scroll to zoom.',
-  lead: () => maxTau + 0.15,
-  enter() { pipeWorld.visible = true; scene.background = PIPE_BG; scene.fog = PIPE_FOG; scene.environment = null; },
+  lead: () => Math.max(maxTau, selfLead) + 0.15,
+  enter() { pipeWorld.visible = true; scene.background = PIPE_BG; scene.fog = PIPE_FOG; scene.environment = null; setBloom(0.9, 0.5, 0.72); },
   exit() { clearLayout(); pipeWorld.visible = false; },
   load(entry) {
     if (entry.kindsSig !== kindsSig()) assignParts(entry);   // instrument toggles changed since this song was set up
@@ -922,17 +1454,33 @@ const pipeMachine = {
   refresh(entry) { buildLayout(entry.specs); },
   schedule(e, hitAbs, entry) {
     const st = stationById[entry.map[e.part]];
-    if (st) spawn(routeIn(st, e.note), hitAbs, e.vel / 127);
+    if (st) playOnStation(st, e.note, hitAbs, e.vel / 127, e.dur);
   },
   live(note, vel, ch, mode) {
-    const r = liveRoute(note, ch);
-    if (!r) return false;
-    // delayed: hit lands after the longest flight, so every ball flies its full arc
-    // instant: hit lands almost now, so the ball appears already mid-flight
-    spawn(r, nowSec() + (mode === 'delay' ? maxTau + 0.05 : 0.07), vel / 127);
+    const st = liveStation(note, ch);
+    if (!st) return false;
+    // delayed: the hit lands after the full flight or mechanism, so everything plays out in full
+    // instant: it lands almost now, so balls and marbles appear already on their way
+    playOnStation(st, note, nowSec() + (mode === 'delay' ? Math.max(maxTau, st.lead || 0) + 0.05 : 0.07), vel / 127, 0.35);
     return true;
   },
-  update(now, dt) { updateBalls(now, dt); updateInstruments(now); updateTubes(now); },
+  update(now, dt) {
+    updateBalls(now, dt); updateInstruments(now); updateTubes(now);
+    for (const st of stations) { st.heat *= Math.exp(-dt * 0.8); if (st.tick) st.tick(now, dt); }
+  },
+  // auto camera: a wide view of the ring, close on the busiest instrument, low on the tower, or overhead
+  pickShot() {
+    const wideR = Math.min(70, Math.max(24, (layoutR + 2) * 2.4));
+    const busy = stations.reduce((m, st) => (!m || st.heat > m.heat ? st : m), null);
+    const roll = Math.random();
+    if (!busy || busy.heat < 0.3 || roll < 0.25) return { theta: orbit.theta + 0.5, phi: 0.62, r: wideR, target: V(0, 1.6, 0), drift: 0.05 };
+    if (roll < 0.7) {
+      const a = busy.angle;
+      return { theta: Math.atan2(-Math.cos(a), -Math.sin(a)) + (Math.random() - 0.5) * 0.5, phi: 0.3, r: 6.5, target: V(busy.R * Math.cos(a), 1.5, busy.R * Math.sin(a)), drift: 0.02 };
+    }
+    if (roll < 0.85) return { theta: orbit.theta, phi: 0.12, r: wideR * 0.55, target: V(0, 3.2, 0), drift: 0.06 };
+    return { theta: orbit.theta + 1, phi: 1.15, r: wideR * 0.85, target: V(0, 0, 0), drift: 0.04 };
+  },
   inFlight: () => balls.filter(b => b.launched && b.phase === 0).length,
   hits: () => hitCount,
 };
@@ -1431,6 +1979,11 @@ const body = { nod: spr(140, 0.45), lean: spr(80, 0.6), roll: spr(60, 0.5), twis
 // [head nod, torso drive] impulse per piece
 const BODY_KICK = { kick: [1, 0.45], snare: [0.6, 0.2], crash: [0.5, 0.3], floor: [0.35, 0.15], tomMid: [0.3, 0.12], tomHi: [0.3, 0.12], ride: [0.15, 0.04], hat: [0.1, 0] };
 
+// where each kit piece's hit light goes, and its color
+const piecePoint = p => p === 'kick' ? KICK.c.clone().add(V(0, 0.1, -0.3)) : KIT[p] ? KIT[p].strike.clone().add(V(0, 0.12, 0)) : V(0, 1, 0.4);
+const DOLL_LIGHT = Object.fromEntries(Object.entries({ kick: 0xff3d8b, snare: 0xffffff, crash: 0xffd27a, ride: 0xffc7e0, hat: 0xfff0f8, tomHi: 0xff8fc8, tomMid: 0xff74b6, floor: 0xff5aa5 }).map(([k, c]) => [k, new THREE.Color(c)]));
+let dollHeat = 0;
+
 function updateDoll(now, dt) {
   // fire piece reactions as their hit times pass
   pieceHits.sort((a, b) => a.t - b.t);
@@ -1438,6 +1991,8 @@ function updateDoll(now, dt) {
     const h = pieceHits.shift(), st = pieceState[h.piece];
     if (st) { st.t0 = h.t; st.amp = 0.35 + 0.65 * h.vel; }
     dollHits++;
+    flashAt(dollRoot.localToWorld(piecePoint(h.piece)), DOLL_LIGHT[h.piece] || DOLL_LIGHT.hat, h.vel, 1.8, 10);
+    dollHeat += h.vel;
     if (h.piece === 'kick') kickPulse = { t0: h.t, amp: h.vel };
     if (h.piece === 'crash') key.intensity = 1.8;
     // each hit nudges the body's springs: kicks drive the head and torso, hand strokes rock toward their side
@@ -1446,6 +2001,7 @@ function updateDoll(now, dt) {
     if (h.hand) body.roll.v += (h.hand === 'L' ? 1 : -1) * 0.3 * h.vel;
   }
   key.intensity += (1.1 - key.intensity) * Math.min(1, dt * 4);
+  dollHeat *= Math.exp(-dt * 0.8);
   for (const k in limbs) limbs[k].strokes = limbs[k].strokes.filter(s => s.t > now - 1.5);
 
   // body: springs ease every movement in and let it settle; a slow breath underneath
@@ -1753,19 +2309,19 @@ const dollMachine = {
   id: 'doll', label: 'Doll Drummer', blurb: 'Every stick winds up ahead of its note so it lands exactly on the beat. Drag to orbit, scroll to zoom.',
   lead: () => 0.5,
   enter() {
-    dollWorld.visible = true; scene.background = DOLL_BG; scene.fog = null; scene.environment = studioEnv;
+    dollWorld.visible = true; scene.background = DOLL_BG; scene.fog = null; scene.environment = studioEnv; setBloom(0.35, 0.3, 0.97);
     resetLimbs();
     Object.assign(orbit, { theta: 0.42, phi: 0.16, r: 3.0 }); orbit.target.set(0, 0.92, 0.25);
   },
   exit() { dollWorld.visible = false; scene.environment = null; resetLimbs(); },
-  load(entry) { if (!entry.dollMap) defaultDollMap(entry); resetLimbs(); },
+  load(entry) { if (!entry.dollMap) defaultDollMap(entry); resetLimbs(); preloadSamples(); },
   refresh() {},
   schedule(e, hitAbs, entry) {
     const role = entry.dollMap[e.part];
     if (role === 'drummer') drumHit(e.ch === 9 ? (KIT_NOTE[e.note] || 'hat') : pieceFromPitch(e.note), hitAbs, e.vel / 127);
     else if (role === 'backing') {
       const pt = entry.parts.find(p => p.key === e.part);
-      playVoice(VOICES[backingKind(pt)](mtof(e.note)), hitAbs, e.vel / 127 * 0.8);
+      playNote(backingKind(pt), e.note, hitAbs, e.vel / 127 * 0.8, e.dur);
     }
   },
   live(note, vel, ch, mode) {
@@ -1774,6 +2330,20 @@ const dollMachine = {
     return true;
   },
   update(now, dt) { updateDoll(now, dt); },
+  // auto camera: front, close on the hands, side profile, low hero, over the shoulder, or overhead
+  pickShot() {
+    const shots = [
+      [3, { theta: 0.42, phi: 0.16, r: 3.0, target: V(0, 0.92, 0.25), drift: 0.02 }],
+      [dollHeat > 3 ? 3 : 1, { theta: 0.15, phi: 0.38, r: 1.55, target: V(0, 0.95, 0.45), drift: 0.03 }],
+      [1.5, { theta: 1.4, phi: 0.12, r: 2.2, target: V(0, 0.9, 0.3), drift: -0.02 }],
+      [1, { theta: -0.1, phi: 0.03, r: 2.3, target: V(0, 1.05, 0.3), drift: 0.015 }],
+      [1.2, { theta: -0.9, phi: 0.25, r: 2.0, target: V(0, 0.9, 0.3), drift: 0.02 }],
+      [0.6, { theta: 0.3, phi: 1.05, r: 2.4, target: V(0, 0.6, 0.35), drift: 0.03 }],
+    ];
+    let pick = Math.random() * shots.reduce((sum, [w]) => sum + w, 0);
+    for (const [w, shot] of shots) { pick -= w; if (pick <= 0) return shot; }
+    return shots[0][1];
+  },
   beforeRender: renderReflection,
   inFlight: () => pieceHits.length,
   hits: () => dollHits,
@@ -1814,6 +2384,7 @@ function setMachine(id) {
   machine.exit();
   machine = m;
   machine.enter();
+  director.shot = null;
   if (current) { machine.load(current); renderParts(current); }
   if (song) song.idx = song.entry.notes.findIndex(e => song.start + e.time > nowSec() + machine.lead() * 0.5);
   if (song && song.idx < 0) song.idx = song.entry.notes.length;
@@ -1993,7 +2564,7 @@ async function discoverSongs() {
   } catch { /* no folder listing: drag files in instead */ }
 }
 
-$('#playDemo').onclick = () => { ensureAudio(); soundOn = true; syncSound(); cur = -1; playEntry(DEMO, true); setStatus('Playing the demo groove on a loop: marimba, bass, vibes, glockenspiel, horns and drums.'); };
+$('#playDemo').onclick = () => { ensureAudio(); soundOn = true; syncSound(); cur = -1; playEntry(DEMO, true); setStatus('Playing the demo groove on a loop across ten instruments.'); };
 $('#stopBtn').onclick = () => { song = null; clearBalls(); resetLimbs(); $('#tSource').textContent = 'Live input'; setStatus('Stopped. Live input and keyboard still work on the current instruments.'); };
 $('#soundBtn').onclick = () => { ensureAudio(); soundOn = !soundOn; syncSound(); };
 // instrument type toggles: apply to every song, remembered in this browser
@@ -2033,6 +2604,30 @@ $('#autoAssign').onclick = () => {
   setStatus(`Every part of ${current.name} is mapped automatically again.`);
 };
 renderChips();
+// effect toggles: apply to both machines, remembered in this browser
+function renderFx() {
+  const box = $('#fxChips');
+  box.innerHTML = '';
+  for (const [k, label, tip] of FX_INFO) {
+    const b = document.createElement('button');
+    b.className = 'chip'; b.title = tip; b.textContent = label;
+    b.setAttribute('aria-pressed', FX[k]);
+    b.onclick = () => toggleFx(k);
+    box.appendChild(b);
+  }
+}
+function toggleFx(k) {
+  FX[k] = !FX[k];
+  try { localStorage.setItem('pipeRig.fx', JSON.stringify(FX)); } catch { /* still applies now */ }
+  renderFx();
+  if (k === 'reverb' && reverbWet) reverbWet.gain.value = FX.reverb ? 0.3 : 0;
+  if (k === 'samples') preloadSamples();
+  if (k === 'returns') for (const st of stations) if (st.ret) st.ret.objs.forEach(o => o.visible = FX.returns);
+  if (k === 'director') director.shot = null;
+  const [, label, tip] = FX_INFO.find(f => f[0] === k);
+  setStatus(`${label} ${FX[k] ? 'on' : 'off'}. ${tip}.` + (k === 'glow' && !composer ? ' The glow add-on did not load, so this has no effect.' : ''));
+}
+renderFx();
 
 $('#dollIn').addEventListener('change', e => { loadDollFiles(e.target.files); e.target.value = ''; });
 $('#dollReset').onclick = () => { removeCustom(); $('#dollReset').hidden = true; $('#dollStatus').textContent = 'Back to the built-in doll.'; };
@@ -2082,16 +2677,33 @@ function onMidi(e) {
   if ((s & 0xF0) === 0x90 && b > 0) liveNote(a, b, s & 15);
 }
 
+// ---------- auto camera: picks a shot from the machine every few seconds and eases toward it ----------
+const director = { shot: null, next: 0 };
+function angleTo(a, b) { let d = (b - a) % (2 * Math.PI); if (d > Math.PI) d -= 2 * Math.PI; if (d < -Math.PI) d += 2 * Math.PI; return d; }
+function directCamera(now, dt) {
+  // dragging or scrolling hands the camera to the viewer for 8 seconds
+  if (!FX.director || reduceMotion || drag || now - lastTouch < 8 || !machine.pickShot) { director.shot = null; return false; }
+  if (!director.shot || now > director.next) { director.shot = machine.pickShot(now); director.next = now + 4.5 + Math.random() * 3.5; }
+  const s = director.shot, k = 1 - Math.exp(-dt * 0.8);
+  s.theta += (s.drift || 0) * dt;
+  orbit.theta += angleTo(orbit.theta, s.theta) * k;
+  orbit.phi += (s.phi - orbit.phi) * k;
+  orbit.r += (s.r - orbit.r) * k;
+  orbit.target.lerp(s.target, k);
+  return true;
+}
+
 // ---------- loop ----------
 let last = nowSec(), hudT = 0;
 function frame() {
   const now = nowSec(), dt = Math.min(0.05, now - last); last = now;
   pumpSong(now);
   machine.update(now, dt);
-  if (!reduceMotion && !drag && now - lastTouch > 5) orbit.theta += dt * 0.03;
+  updateHitLights(now);
+  if (!directCamera(now, dt) && !reduceMotion && !drag && now - lastTouch > 5) orbit.theta += dt * 0.03;
   placeCam();
   if (machine.beforeRender) machine.beforeRender();
-  renderer.render(scene, camera);
+  if (FX.glow && composer) composer.render(); else renderer.render(scene, camera);
   if (now - hudT > 0.15) {
     hudT = now;
     $('#tClock').textContent = song ? fmt(now - song.start) + ' / ' + fmt(song.dur) : '—';

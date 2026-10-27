@@ -4,8 +4,9 @@
     {
       "name": "pipe-rig",
       "runtimeExecutable": "python",
-      "runtimeArgs": ["-m", "http.server", "8765"],
-      "port": 8765
+      "runtimeArgs": ["-m", "http.server", "8775", "--bind", "127.0.0.1"],
+      "port": 8775,
+      "autoPort": false
     }
   ]
 }
