@@ -2962,6 +2962,92 @@ function updateEyes(b, now, dt) {
     e.bottom.rotation.x = 0.95 - 0.7 * Math.max(0, shut);
   }
 }
+// ---------- splashes: droplets flung from every hit that land as little splats, and sticky strands ----------
+// Droplets fly on real ballistic arcs, stretched along their speed, and flatten into splats that spread and
+// shrink away; each landing ticks faintly. After a long press the pearl lifts off with a strand of jelly that
+// stretches thin and snaps, dropping a few beads.
+const dropGeo = new THREE.SphereGeometry(1, 14, 10);
+const strandGeo = new THREE.CylinderGeometry(1, 1, 1, 10, 1, true);
+const MAX_DROPS = 90;
+const dropTmp = { m: new THREE.Matrix4(), q: new THREE.Quaternion(), s: V(0, 0, 0), d: V(0, 0, 0) };
+function makeSplash(b) {
+  const mat = new THREE.MeshPhysicalMaterial({ color: b.color, roughness: 0.12, clearcoat: 1, clearcoatRoughness: 0.04, emissive: b.color, emissiveIntensity: 0.12 });
+  const inst = new THREE.InstancedMesh(dropGeo, mat, MAX_DROPS);
+  inst.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  inst.count = 0; inst.castShadow = true; inst.frustumCulled = false;
+  squishWorld.add(inst);
+  b.splash = { inst, mat, drops: [], tickAt: 0 };
+}
+function spawnDrops(b, at, normal, vel, n, speedScale = 1) {
+  const s = b.splash, now = nowSec();
+  for (let k = 0; k < n; k++) {
+    if (s.drops.length >= MAX_DROPS) s.drops.shift();
+    // mostly outward and up, so most drops clear the blob and land around it
+    const a = Math.random() * Math.PI * 2, dir = normal.clone().multiplyScalar(0.6).add(V(Math.cos(a), 0, Math.sin(a)).multiplyScalar(0.9 + Math.random() * 0.5));
+    dir.y += 0.7 + Math.random() * 0.5; dir.normalize();
+    s.drops.push({
+      p: at.clone().addScaledVector(normal, 0.04), v: dir.multiplyScalar((1.2 + Math.random() * 1.6) * (0.5 + vel) * speedScale),
+      r: (0.022 + Math.random() * 0.035) * (0.7 + 0.5 * vel), landed: false, landT: 0, born: now,
+    });
+  }
+}
+function updateSplash(b, now, dt) {
+  const s = b.splash, t = dropTmp;
+  s.drops = s.drops.filter(d => !d.dead && (d.landed ? now - d.landT < 1.7 : now - d.born < 4));
+  s.drops.forEach((d, i) => {
+    if (!d.landed) {
+      d.v.y -= 9.8 * dt;
+      d.p.addScaledVector(d.v, dt);
+      // falling back onto any blob, it merges into the jelly with a tiny plop
+      if (d.v.y < 0 && now - d.born > 0.1) for (const o of blobs) {
+        const k = o.mesh.scale.x, lx = (d.p.x - o.mesh.position.x) / k, ly = d.p.y / k, lz = (d.p.z - o.mesh.position.z) / k;
+        if ((lx * lx + lz * lz) / 1.1 + ((ly - 0.8) / 0.85) ** 2 < 1) { d.dead = true; o.qv += 0.03; break; }
+      }
+      if (d.dead) return;
+      if (d.p.y <= d.r * 0.3) {
+        d.landed = true; d.landT = now; d.p.y = 0.003;
+        // a faint tick as it lands, a few at most at once
+        if (soundOn && actx && now > s.tickAt) {
+          s.tickAt = now + 0.03;
+          const f = 1800 + Math.random() * 2200, at = actx.currentTime + 0.005;
+          osc('sine', f, at, 0.03, out(at, Math.min(0.05, 0.012 + 0.01 * d.v.length()), 0.03), f * 0.6);
+        }
+      }
+      // stretched along the direction it's flying, more the faster it goes
+      const sp = d.v.length();
+      t.q.setFromUnitVectors(UP, t.d.copy(d.v).divideScalar(sp || 1));
+      t.s.set(d.r, d.r * (1 + Math.min(2.2, sp * 0.18)), d.r);
+    } else {
+      // a splat: it spreads out fast, sits a moment, then shrinks away
+      const age = now - d.landT, spread = 1 + 1.3 * Math.min(1, age * 9), fade = age < 1 ? 1 : Math.max(0, 1 - (age - 1) / 0.7);
+      t.q.identity();
+      t.s.set(d.r * 1.6 * spread * fade, d.r * 0.22 * fade + 0.0001, d.r * 1.6 * spread * fade);
+    }
+    t.m.compose(d.p, t.q, t.s);
+    s.inst.setMatrixAt(i, t.m);
+  });
+  s.inst.count = s.drops.length;
+  s.inst.instanceMatrix.needsUpdate = true;
+}
+// the strand between a lifting pearl and the jelly it pressed into
+function updateStrand(b, p, contact, nrm, up) {
+  if (!p.strand) { p.strand = new THREE.Mesh(strandGeo, b.splash.mat); p.strand.castShadow = true; squishWorld.add(p.strand); }
+  const sticky = p.poke.hold > 0.25 && !p.snapped && up >= 0;
+  p.strand.visible = sticky;
+  if (!sticky) return;
+  const from = contact.clone().addScaledVector(nrm, -0.1), to = p.mesh.position, len = from.distanceTo(to);
+  if (len > 0.55) {
+    // it snaps: the strand is gone and a few beads fall from where it broke
+    p.snapped = true; p.strand.visible = false;
+    spawnDrops(b, from.clone().lerp(to, 0.5), V(0, -0.3, 0), 0.2, 4, 0.4);
+    if (soundOn && actx) { const at = actx.currentTime + 0.005; osc('sine', 900, at, 0.05, out(at, 0.06, 0.05), 2400); }
+    return;
+  }
+  const rad = 0.04 * (1 - len / 0.62) + 0.006;
+  p.strand.position.copy(from).lerp(to, 0.5);
+  p.strand.quaternion.setFromUnitVectors(UP, dropTmp.d.copy(to).sub(from).normalize());
+  p.strand.scale.set(rad, len, rad);
+}
 function makeBlob(i, info) {
   const geo = new THREE.BufferGeometry();
   const pos = Float32Array.from(SQ.rest);
@@ -2971,7 +3057,9 @@ function makeBlob(i, info) {
   geo.boundingSphere = new THREE.Sphere(V(0, 0.8, 0), 2.2);
   const color = new THREE.Color(GUMMY[i % GUMMY.length]);
   const mat = new THREE.MeshPhysicalMaterial({
-    color, transmission: 0.82, thickness: 1.4, attenuationColor: color, attenuationDistance: 0.55, ior: 1.45,
+    color, transmission: 0.82, thickness: 1.4, attenuationColor: color, attenuationDistance: 0.35, ior: 1.45,
+    // thin edges stay bright while the thick middle deepens, and a soft sheen glows at grazing angles
+    sheen: 0.5, sheenRoughness: 0.35, sheenColor: color.clone().lerp(new THREE.Color(1, 1, 1), 0.5),
     roughness: 0.14, clearcoat: 1, clearcoatRoughness: 0.05, specularIntensity: 1, emissive: color, emissiveIntensity: 0,
   });
   const mesh = new THREE.Mesh(geo, mat);
@@ -2982,12 +3070,14 @@ function makeBlob(i, info) {
     q: 0, qv: 0, heat: 0, pokes: [], pearls: [], voices: [], ...info,
   };
   makeEyes(b);
+  makeSplash(b);
   return b;
 }
 function clearBlobs() {
   for (const b of blobs) {
     squishWorld.remove(b.mesh); b.geo.dispose(); b.mesh.material.dispose();
-    for (const p of b.pearls) squishWorld.remove(p.mesh);
+    for (const p of b.pearls) { squishWorld.remove(p.mesh); if (p.strand) squishWorld.remove(p.strand); }
+    squishWorld.remove(b.splash.inst); b.splash.mat.dispose();
     for (const e of b.eyes) squishWorld.remove(e.socket);
     b.lidMat.dispose();
   }
@@ -3038,7 +3128,7 @@ function slotFor(b, note) {
   const u = b.hi > b.lo ? (note - b.lo) / (b.hi - b.lo) : 0.5;
   return SQ.slots[Math.round(clamp(u, 0, 1) * (SQ.slots.length - 1))];
 }
-function pokeAt(b, vi, t, hold, vel, radius = 0.42) {
+function pokeAt(b, vi, t, hold, vel, radius = 0.36) {
   const r = SQ.rest, cx = r[vi * 3], cy = r[vi * 3 + 1], cz = r[vi * 3 + 2], idx = [], w = [];
   for (let i = 0; i < SQ.n; i++) {
     const d = Math.hypot(r[i * 3] - cx, r[i * 3 + 1] - cy, r[i * 3 + 2] - cz);
@@ -3050,7 +3140,7 @@ function pokeAt(b, vi, t, hold, vel, radius = 0.42) {
   // the pearl that does the pressing, falling in from above so it lands exactly at t
   let pearl = b.pearls.find(p => !p.busy);
   if (!pearl) { pearl = { mesh: new THREE.Mesh(pearlGeo, pearlMat) }; pearl.mesh.castShadow = true; squishWorld.add(pearl.mesh); b.pearls.push(pearl); }
-  Object.assign(pearl, { busy: true, poke, from: V((Math.random() - 0.5) * 0.6, 1.6 + Math.random() * 0.5, 0.2 + Math.random() * 0.4) });
+  Object.assign(pearl, { busy: true, snapped: false, poke, from: V((Math.random() - 0.5) * 0.6, 1.6 + Math.random() * 0.5, 0.2 + Math.random() * 0.4) });
   pearl.mesh.visible = false;
   return poke;
 }
@@ -3121,6 +3211,7 @@ function stepBlob(b, now, dt) {
       b.qv += 0.45 * p.vel * vary(0.4); b.heat += p.vel; b.squint = Math.max(b.squint, 0.3 + 0.55 * p.vel); sqHits++; grooveHit(p.vel);
       const wp = b.mesh.localToWorld(V(pos[p.vi * 3], pos[p.vi * 3 + 1], pos[p.vi * 3 + 2]));
       flashAt(wp, b.color, p.vel, 2.4, 8, 0.5);
+      spawnDrops(b, wp, V(nrm[p.vi * 3], nrm[p.vi * 3 + 1], nrm[p.vi * 3 + 2]), p.vel, Math.round(1 + p.vel * 6));
       if (p.vel > 0.7 && now - sqLastRipple > 0.7) {
         sqLastRipple = now;
         const rp = sqRipples[sqRippleIdx++ % sqRipples.length];
@@ -3132,7 +3223,7 @@ function stepBlob(b, now, dt) {
     for (let k = 0; k < p.idx.length; k++) dent[p.idx[k]] += p.depth * amt * p.w[k];
   }
   // presses that overlap saturate instead of adding up, so a busy blob dents deeper without caving in
-  for (let i = 0; i < SQ.n; i++) if (dent[i]) { const s = 0.32 * (1 - Math.exp(-dent[i] / 0.32)); for (let c = 0; c < 3; c++) off[i * 3 + c] -= nrm[i * 3 + c] * s; }
+  for (let i = 0; i < SQ.n; i++) if (dent[i]) { const s = 0.24 * (1 - Math.exp(-dent[i] / 0.24)); for (let c = 0; c < 3; c++) off[i * 3 + c] -= nrm[i * 3 + c] * s; }
   load = 0.16 * (1 - Math.exp(-load * 2.5));
   if (b.kicks) {
     for (const k of b.kicks) if (now >= k.t && !k.done) { k.done = true; b.qv += 1.2 * k.vel; }
@@ -3174,10 +3265,11 @@ function updatePearls(b, now) {
     const contact = surf.addScaledVector(nrm, 0.11);
     const u = (now - (k.t - SQ_LEAD)) / SQ_LEAD, up = now - (k.t + k.hold);
     p.mesh.visible = u >= 0 && up < 0.45;
-    if (!p.mesh.visible) { if (up >= 0.45) p.busy = false; continue; }
+    if (!p.mesh.visible) { if (up >= 0.45) p.busy = false; if (p.strand) p.strand.visible = false; continue; }
     if (u < 1) { p.mesh.position.copy(contact).add(p.from.clone().multiplyScalar(1 - u * u)); p.mesh.scale.setScalar(Math.min(1, u * 3)); }
     else if (up < 0) { p.mesh.position.copy(contact); p.mesh.scale.setScalar(1); }
     else { const e = up / 0.45; p.mesh.position.copy(contact).add(V(0, e * 1.2, 0)); p.mesh.scale.setScalar(1 - e); }
+    updateStrand(b, p, contact, nrm, up);
   }
 }
 // the vowel opens as the body stretches and closes as it squashes; the pitch bends with the wobble
@@ -3288,7 +3380,7 @@ const squishMachine = {
     return true;
   },
   update(now, dt) {
-    for (const b of blobs) { stepBlob(b, now, dt); updatePearls(b, now); updateEyes(b, now, dt); shapeVoices(b); }
+    for (const b of blobs) { stepBlob(b, now, dt); updatePearls(b, now); updateEyes(b, now, dt); updateSplash(b, now, dt); shapeVoices(b); }
     const u = sqBackdrop.material.uniforms;
     u.u_time.value = now;
     sqRipples.forEach((r, k) => { u.u_t0.value[k] = r.t0; });
