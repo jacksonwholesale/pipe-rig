@@ -2675,18 +2675,30 @@ try {
   if (saved && ENVS.some(([n]) => n === saved.name)) Object.assign(ENV_STATE, { name: saved.name, backdrop: !!saved.backdrop });
 } catch { /* built-in */ }
 const envCache = {};
+// the .hdr file itself, or a base64 JSON copy of it for hosts that don't serve .hdr files
+async function fetchHdr(name) {
+  const url = `assets/hdri/${name}_1k.hdr`;
+  const r = await fetch(url).catch(() => null);
+  if (r && r.ok) return r.arrayBuffer();
+  const j = await fetch(url + '.json');
+  if (!j.ok) throw new Error('the file did not load');
+  const bin = atob((await j.json()).b64), bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes.buffer;
+}
 function loadEnv(name) {
   if (envCache[name]) return envCache[name];
-  return envCache[name] = new Promise((resolve, reject) => {
-    if (!THREE.RGBELoader) { reject(new Error('the HDRI loader did not load')); return; }
-    new THREE.RGBELoader().setDataType(THREE.HalfFloatType).load(`assets/hdri/${name}_1k.hdr`, tex => {
-      tex.mapping = THREE.EquirectangularReflectionMapping;
-      const pm = new THREE.PMREMGenerator(renderer);
-      const env = pm.fromEquirectangular(tex).texture;
-      pm.dispose();
-      resolve({ env, bg: tex });
-    }, undefined, () => { delete envCache[name]; reject(new Error('the file did not load')); });
-  });
+  return envCache[name] = (async () => {
+    if (!THREE.RGBELoader) throw new Error('the HDRI loader did not load');
+    const d = new THREE.RGBELoader().setDataType(THREE.HalfFloatType).parse(await fetchHdr(name));
+    const tex = new THREE.DataTexture(d.data, d.width, d.height, d.format, d.type);
+    Object.assign(tex, { encoding: THREE.LinearEncoding, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, generateMipmaps: false, flipY: true, mapping: THREE.EquirectangularReflectionMapping });
+    tex.needsUpdate = true;
+    const pm = new THREE.PMREMGenerator(renderer);
+    const env = pm.fromEquirectangular(tex).texture;
+    pm.dispose();
+    return { env, bg: tex };
+  })().catch(err => { delete envCache[name]; throw err; });
 }
 // reflections from an HDRI follow the stage-light dial, well below full, so polished metal doesn't glare
 function applyEnvIntensity() {
