@@ -91,6 +91,7 @@ body[data-machine="doll"] .hud p, body[data-machine="doll"] .telemetry, body[dat
 body[data-machine="doll"] .hud h1 { color: #d81b72; }
 body[data-machine="squish"] .hud p, body[data-machine="squish"] .telemetry, body[data-machine="squish"] .telemetry span b { color: #2b2746; }
 body[data-machine="squish"] .hud h1 { color: #4a2bb8; }
+body[data-machine="squish"] .hud { text-shadow: 0 0 8px rgba(255, 255, 255, 0.85), 0 0 2px rgba(255, 255, 255, 0.9); }
 .dial { display: inline-flex; align-items: center; gap: 8px; font-size: 0.8rem; color: var(--muted); }
 .dial input { width: 110px; accent-color: var(--copper); }
 .take { display: inline-flex; align-items: center; gap: 2px; padding: 2px 4px; border: 1px solid #2c3647; border-radius: 999px; font-size: 0.78rem; }
@@ -164,6 +165,7 @@ body.dropping #stage { outline: 3px dashed var(--copper); outline-offset: -12px;
     <label class="dial" for="grooveAmt">Groove amount <input id="grooveAmt" type="range" min="0" max="2" step="0.05"></label>
     <label class="dial" for="envSel">Environment <select id="envSel"></select></label>
     <label class="check"><input type="checkbox" id="envBg"> Show as backdrop</label>
+    <label class="dial" for="envBlur">Backdrop blur <input id="envBlur" type="range" min="0" max="0.5" step="0.01"></label>
   </div>
   <div class="row" id="soundRow">
     <span class="label">Sound</span>
@@ -2884,6 +2886,82 @@ let sqHits = 0, sqLastRipple = -10;
 const pearlGeo = new THREE.SphereGeometry(0.11, 24, 16);
 const pearlMat = new THREE.MeshPhysicalMaterial({ color: 0xf4f0ff, metalness: 0.15, roughness: 0.12, clearcoat: 1, iridescence: 1, iridescenceIOR: 1.6, iridescenceThicknessRange: [180, 620] });
 
+// ---------- eyes: glossy eyeballs set into each blob, with lids that blink, squint and widen ----------
+// The eyes ride on two points of the soft body, so they bob and tilt with every squash. Each eyeball turns
+// toward what's happening (the next pearl about to land, the viewer, a neighbour) with quick saccades.
+const EYE_SPOTS = [-1, 1].map(side => {
+  const d = V(0.4 * side, 0.4, 0.84).normalize();
+  let best = 0, bd = -2;
+  for (let i = 0; i < SQ.n; i++) { const dot = SQ.normal[i * 3] * d.x + SQ.normal[i * 3 + 1] * d.y + SQ.normal[i * 3 + 2] * d.z; if (dot > bd) { bd = dot; best = i; } }
+  return best;
+});
+const eyeGeo = new THREE.SphereGeometry(1, 32, 24);
+const lidGeo = new THREE.SphereGeometry(1.08, 32, 12, 0, Math.PI * 2, 0, Math.PI / 2);   // a cap over the top half
+const eyeWhite = new THREE.MeshPhysicalMaterial({ color: 0xf2efe9, roughness: 0.25, clearcoat: 1, clearcoatRoughness: 0.02 });
+const pupilMat = new THREE.MeshPhysicalMaterial({ color: 0x0a0910, roughness: 0.2, clearcoat: 1, clearcoatRoughness: 0.02 });
+const EYE_Z = V(0, 0, 1);
+function makeEyes(b) {
+  b.lidMat = new THREE.MeshPhysicalMaterial({ color: b.color, roughness: 0.3, clearcoat: 1, clearcoatRoughness: 0.08, side: THREE.DoubleSide });
+  b.eyes = EYE_SPOTS.map(vi => {
+    const socket = new THREE.Group(), ball = new THREE.Group();
+    const white = new THREE.Mesh(eyeGeo, eyeWhite), pupil = new THREE.Mesh(eyeGeo, pupilMat);
+    pupil.scale.set(0.5, 0.5, 0.2); pupil.position.z = 0.88;
+    ball.add(white, pupil);
+    const top = new THREE.Mesh(lidGeo, b.lidMat), bottom = new THREE.Mesh(lidGeo, b.lidMat);
+    bottom.rotation.order = 'XYZ'; bottom.rotation.z = Math.PI;   // the same cap flipped under the eye
+    socket.add(ball, top, bottom);
+    white.castShadow = top.castShadow = true;
+    squishWorld.add(socket);
+    return { vi, socket, ball, pupil, top, bottom, look: new THREE.Quaternion() };
+  });
+  Object.assign(b, { blinkAt: nowSec() + 1 + Math.random() * 4, blinkT: -10, squint: 0, wide: 0, idleUntil: 0, idleTarget: V(0, 1, 8) });
+}
+const eyeTmp = { n: V(0, 0, 0), p: V(0, 0, 0), d: V(0, 0, 0), q: new THREE.Quaternion() };
+function updateEyes(b, now, dt) {
+  // what to look at: the next pearl falling onto this blob, otherwise wander between the viewer, a neighbour and the room
+  let target = null, soonest = Infinity;
+  for (const p of b.pearls) if (p.busy && p.mesh.visible && p.poke.t >= now - 0.05 && p.poke.t < soonest) { soonest = p.poke.t; target = p.mesh.position; }
+  if (!target) {
+    if (now > b.idleUntil) {
+      const roll = Math.random(), other = blobs[Math.floor(Math.random() * blobs.length)];
+      if (roll < 0.65) b.idleTarget.copy(camera.position);
+      else if (roll < 0.85 && other && other !== b) b.idleTarget.copy(other.mesh.position).add(V(0, 0.5, 0));
+      else b.idleTarget.set((Math.random() - 0.5) * 10, Math.random() * 4, 4 + Math.random() * 4);
+      b.idleUntil = now + 1.2 + Math.random() * 3;
+    }
+    target = b.idleTarget;
+  }
+  // lids: a resting droop, blinks every few seconds (sometimes twice), squints on hits, wide when grabbed,
+  // and half shut in bliss while a long note presses in
+  if (now > b.blinkAt) { b.blinkT = now; b.blinkAt = now + (Math.random() < 0.15 ? 0.3 : 2 + Math.random() * 4); }
+  const bt = (now - b.blinkT) / 0.16, blink = bt >= 0 && bt < 1 ? Math.sin(bt * Math.PI) : 0;
+  const bliss = b.pokes.some(p => now >= p.t && now < p.t + p.hold && p.hold > 0.5) ? 0.4 : 0;
+  b.squint *= Math.exp(-dt * 5); b.wide *= Math.exp(-dt * (b.pull ? 0 : 2.5));
+  const shut = clamp(Math.max(0.12 + bliss, blink, b.squint) - 0.3 * b.wide, -0.15, 1);
+  const s = b.mesh.scale.x, r = 0.24 * s;
+  const nrm = b.geo.attributes.normal.array, k = 1 - Math.exp(-dt * 28);
+  for (const e of b.eyes) {
+    const i3 = e.vi * 3;
+    eyeTmp.n.set(nrm[i3], nrm[i3 + 1], nrm[i3 + 2]).normalize();
+    // sunk a third into the jelly, facing out from the surface but mostly forward
+    eyeTmp.p.set(b.pos[i3], b.pos[i3 + 1], b.pos[i3 + 2]);
+    b.mesh.localToWorld(eyeTmp.p).addScaledVector(eyeTmp.n, -r * 0.3);
+    e.socket.position.copy(eyeTmp.p);
+    e.socket.scale.setScalar(r);
+    e.socket.lookAt(eyeTmp.d.copy(eyeTmp.p).add(eyeTmp.n).add(V(0, 0, 0.9)));
+    // the eyeball turns toward the target, at most about 40 degrees off centre
+    eyeTmp.d.copy(target);
+    e.socket.worldToLocal(eyeTmp.d).normalize();
+    const ang = eyeTmp.d.angleTo(EYE_Z);
+    if (ang > 0.7) eyeTmp.d.lerp(EYE_Z, 1 - 0.7 / ang).normalize();
+    eyeTmp.q.setFromUnitVectors(EYE_Z, eyeTmp.d);
+    e.ball.quaternion.slerp(eyeTmp.q, k);
+    // pupils shrink on loud hits and open wide in surprise
+    e.pupil.scale.set(0.5 * (1 + 0.25 * b.wide - 0.15 * Math.min(1, b.heat)), 0.5 * (1 + 0.25 * b.wide - 0.15 * Math.min(1, b.heat)), 0.2);
+    e.top.rotation.x = -(1.15 - 1.4 * shut);
+    e.bottom.rotation.x = 0.95 - 0.7 * Math.max(0, shut);
+  }
+}
 function makeBlob(i, info) {
   const geo = new THREE.BufferGeometry();
   const pos = Float32Array.from(SQ.rest);
@@ -2899,15 +2977,19 @@ function makeBlob(i, info) {
   const mesh = new THREE.Mesh(geo, mat);
   mesh.castShadow = true;
   squishWorld.add(mesh);
-  return {
+  const b = {
     i, mesh, geo, pos, vel: new Float32Array(pos.length), off: new Float32Array(pos.length), dent: new Float32Array(SQ.n), color,
     q: 0, qv: 0, heat: 0, pokes: [], pearls: [], voices: [], ...info,
   };
+  makeEyes(b);
+  return b;
 }
 function clearBlobs() {
   for (const b of blobs) {
     squishWorld.remove(b.mesh); b.geo.dispose(); b.mesh.material.dispose();
     for (const p of b.pearls) squishWorld.remove(p.mesh);
+    for (const e of b.eyes) squishWorld.remove(e.socket);
+    b.lidMat.dispose();
   }
   blobs.length = 0;
 }
@@ -3036,7 +3118,7 @@ function stepBlob(b, now, dt) {
       p.kicked = true;
       // the impact: a shove into the surface around the contact, a jolt through the whole body, a light and a ripple
       for (let k = 0; k < p.idx.length; k++) { const i = p.idx[k]; for (let c = 0; c < 3; c++) vel[i * 3 + c] -= nrm[i * 3 + c] * p.w[k] * 2.2 * p.vel; }
-      b.qv += 0.45 * p.vel * vary(0.4); b.heat += p.vel; sqHits++; grooveHit(p.vel);
+      b.qv += 0.45 * p.vel * vary(0.4); b.heat += p.vel; b.squint = Math.max(b.squint, 0.3 + 0.55 * p.vel); sqHits++; grooveHit(p.vel);
       const wp = b.mesh.localToWorld(V(pos[p.vi * 3], pos[p.vi * 3 + 1], pos[p.vi * 3 + 2]));
       flashAt(wp, b.color, p.vel, 2.4, 8, 0.5);
       if (p.vel > 0.7 && now - sqLastRipple > 0.7) {
@@ -3140,7 +3222,7 @@ canvas.addEventListener('pointerdown', e => {
   b.pull = { idx, w, v: V(0, 0, 0) };
   grab = { b, plane, start: hit.point.clone(), base: b.drum ? 48 : Math.round(b.lo || 55), step: -1, voice: null };
   ensureAudio(); if (!soundOn) { soundOn = true; syncSound(); }
-  b.qv += 0.6; b.heat += 0.5;
+  b.qv += 0.6; b.heat += 0.5; b.wide = 1;
 }, { capture: true });
 canvas.addEventListener('pointermove', e => {
   if (!grab) return;
@@ -3206,7 +3288,7 @@ const squishMachine = {
     return true;
   },
   update(now, dt) {
-    for (const b of blobs) { stepBlob(b, now, dt); updatePearls(b, now); shapeVoices(b); }
+    for (const b of blobs) { stepBlob(b, now, dt); updatePearls(b, now); updateEyes(b, now, dt); shapeVoices(b); }
     const u = sqBackdrop.material.uniforms;
     u.u_time.value = now;
     sqRipples.forEach((r, k) => { u.u_t0.value[k] = r.t0; });
@@ -3644,11 +3726,17 @@ const ENVS = [
   ['dikhololo_night', 'Moonlit trees'],
   ['venice_sunset', 'Venice sunset'],
   ['empty_warehouse_01', 'Warehouse'],
+  ['music_hall_01', 'Music hall'],
+  ['comfy_cafe', 'Cozy café'],
+  ['modern_bathroom', 'Bathroom'],
+  ['penguin_museum', 'Penguin museum'],
+  ['empty_play_room', 'Play room'],
 ];
-const ENV_STATE = { name: 'builtin', backdrop: false };
+// blur turns a backdrop into a soft photographic plate, like a long lens with a shallow focus
+const ENV_STATE = { name: 'builtin', backdrop: false, blur: 0.12 };
 try {
   const saved = JSON.parse(localStorage.getItem('pipeRig.env'));
-  if (saved && ENVS.some(([n]) => n === saved.name)) Object.assign(ENV_STATE, { name: saved.name, backdrop: !!saved.backdrop });
+  if (saved && ENVS.some(([n]) => n === saved.name)) Object.assign(ENV_STATE, { name: saved.name, backdrop: !!saved.backdrop, blur: typeof saved.blur === 'number' ? saved.blur : 0.12 });
 } catch { /* built-in */ }
 const envCache = {};
 // the .hdr file itself, or a base64 JSON copy of it for hosts that don't serve .hdr files
@@ -3686,13 +3774,14 @@ function applyEnvironment() {
   const builtIn = () => {
     scene.environment = st.env; scene.background = st.bg; scene.fog = st.fog;
     if (st.backdrop) st.backdrop.visible = true;
+    scene.backgroundBlurriness = 0;
   };
   if (want === 'builtin') { builtIn(); applyEnvIntensity(); return; }
   loadEnv(want).then(e => {
     if (ENV_STATE.name !== want) return;
     builtIn();
     scene.environment = e.env;
-    if (ENV_STATE.backdrop) { scene.background = e.bg; scene.fog = null; if (st.backdrop) st.backdrop.visible = false; }
+    if (ENV_STATE.backdrop) { scene.background = e.bg; scene.backgroundBlurriness = ENV_STATE.blur; scene.fog = null; if (st.backdrop) st.backdrop.visible = false; }
     applyEnvIntensity();
   }).catch(err => {
     setStatus(`Couldn't load that environment: ${err.message}. Using the built-in one.`);
@@ -3710,6 +3799,9 @@ function applyEnvironment() {
     setStatus(sel.value === 'builtin' ? 'Built-in environment.' : `${sel.selectedOptions[0].textContent} environment (Poly Haven, CC0). Tick "Show as backdrop" to see it behind the stage.`);
   };
   bg.onchange = () => { ENV_STATE.backdrop = bg.checked; save(); applyEnvironment(); };
+  const blur = $('#envBlur');
+  blur.value = ENV_STATE.blur;
+  blur.oninput = () => { ENV_STATE.blur = +blur.value; save(); if (ENV_STATE.backdrop && scene.background && scene.background.isTexture) scene.backgroundBlurriness = ENV_STATE.blur; };
 }
 
 function applyLevels() {
