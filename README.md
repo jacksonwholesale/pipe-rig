@@ -10,6 +10,7 @@ MIDI-driven 3D music machines in the browser. Every note is scheduled ahead of t
   - struck by balls: marimba, vibraphone, glockenspiel, harp, horn pipes, bass strings, drum kit, **spring harp** (coils that sway and bounce) and **water bells** (glass bowls that ripple and splash)
   - running their own mechanism: **marble run** (marbles roll a rail and drop onto xylophone bars), **bellows organ** (valves open, pipes glow and puff smoke rings while the bellows breathe) and **laser lyre** (emitters charge, beams snap on and tremble while held)
 - **Doll Drummer** — a jointed fashion doll on a pink sparkle kit. Sticks wind up ahead of each note, hands and feet are posed with two-bone IK, and the body moves on springs. You can load your own rigged humanoid (`.glb`, `.gltf` or `.zip`) and it's driven the same way.
+- **Squish** — translucent gummy blobs, one per part, on a calm stage. Each note drops an iridescent pearl that presses into its blob right on the beat (low notes on the left, high on the right). The blobs are spring-mass soft bodies: they dent, bulge, wobble and settle on their own, and loud hits send rings through the backdrop. The sound comes from the shape: the voice's vowel opens and closes with the blob's squash and its pitch bends with the wobble. Drag a blob to pull it like taffy and it sings, higher the further it stretches.
 
 ## Run it
 
@@ -19,7 +20,7 @@ You can also open the page any other way and drag `.mid` files onto it. Sampled 
 
 ## Controls
 
-- **Machine** — switch between Pipe Rig and Doll Drummer.
+- **Machine** — switch between Pipe Rig, Doll Drummer and Squish.
 - **Songs** — load or drop MIDI files, step with `[` / `]`, auto-advance.
 - **Instruments** (Pipe Rig) — turn instrument types on or off for every song.
 - **Effects** — each switches on or off and is remembered:

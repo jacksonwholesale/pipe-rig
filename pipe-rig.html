@@ -89,6 +89,8 @@ select:focus-visible { outline: 2px solid var(--copper-hi); outline-offset: 1px;
 .partbar button { padding: 4px 10px; font-size: 0.78rem; }
 body[data-machine="doll"] .hud p, body[data-machine="doll"] .telemetry, body[data-machine="doll"] .telemetry span b { color: #7a2350; }
 body[data-machine="doll"] .hud h1 { color: #d81b72; }
+body[data-machine="squish"] .hud p, body[data-machine="squish"] .telemetry, body[data-machine="squish"] .telemetry span b { color: #2b2746; }
+body[data-machine="squish"] .hud h1 { color: #4a2bb8; }
 .dial { display: inline-flex; align-items: center; gap: 8px; font-size: 0.8rem; color: var(--muted); }
 .dial input { width: 110px; accent-color: var(--copper); }
 .take { display: inline-flex; align-items: center; gap: 2px; padding: 2px 4px; border: 1px solid #2c3647; border-radius: 999px; font-size: 0.78rem; }
@@ -125,6 +127,7 @@ body.dropping #stage { outline: 3px dashed var(--copper); outline-offset: -12px;
     <span class="seg" id="machineSeg" role="group" aria-label="Machine that plays the song">
       <button data-m="pipe" aria-pressed="true">Pipe Rig</button>
       <button data-m="doll" aria-pressed="false">Doll Drummer</button>
+      <button data-m="squish" aria-pressed="false">Squish</button>
     </span>
   </div>
   <div class="row">
@@ -209,7 +212,9 @@ import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
-window.THREE = Object.assign({}, CORE, { GLTFLoader, RGBELoader, EffectComposer, RenderPass, ShaderPass, UnrealBloomPass, OutputPass });
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { mergeVertices } from 'three/addons/utils/BufferGeometryUtils.js';
+window.THREE = Object.assign({}, CORE, { GLTFLoader, RGBELoader, EffectComposer, RenderPass, ShaderPass, UnrealBloomPass, OutputPass, RoomEnvironment, mergeVertices });
 // colors in this page were chosen as the values the shaders use, so they aren't converted from sRGB
 CORE.ColorManagement.enabled = false;
 </script>
@@ -1843,6 +1848,7 @@ function danceStations() {
 const pipeMachine = {
   id: 'pipe', label: 'Pipe Rig', blurb: 'Each note fires a ball early enough to land exactly on the beat. Drag to orbit, scroll to zoom.',
   lead: () => Math.max(maxTau * 1.15, selfLead) + 0.15,
+  stage: () => ({ env: null, bg: PIPE_BG, fog: PIPE_FOG }),
   enter() { pipeWorld.visible = true; scene.background = PIPE_BG; scene.fog = PIPE_FOG; scene.environment = null; setBloom(0.6, 0.4, 0.95); },
   exit() { clearLayout(); pipeWorld.visible = false; },
   load(entry) {
@@ -2735,6 +2741,7 @@ const backingKind = pt => { const k = guessKind(pt); return k === 'off' || k ===
 const dollMachine = {
   id: 'doll', label: 'Doll Drummer', blurb: 'Every stick winds up ahead of its note so it lands exactly on the beat. Drag to orbit, scroll to zoom.',
   lead: () => 0.5,
+  stage: () => ({ env: studioEnv, bg: DOLL_BG, fog: null, backdrop }),
   enter() {
     dollWorld.visible = true; scene.background = DOLL_BG; scene.fog = null; scene.environment = studioEnv; setBloom(0.25, 0.3, 3.5);
     resetLimbs();
@@ -2776,7 +2783,461 @@ const dollMachine = {
   hits: () => dollHits,
 };
 
-const MACHINES = { pipe: pipeMachine, doll: dollMachine };
+
+// ---------- squish: gummy soft bodies, each pressed by a pearl on every note ----------
+// Each part of the song gets a translucent blob. A note drops a pearl that presses into the blob exactly on
+// the beat; the blob is a spring-mass soft body, so it dents, bulges, wobbles and settles on its own. The
+// sound comes from the shape: the voice's vowel opens and closes with the blob's squash and its pitch bends
+// with the wobble. Drag a blob to pull it and it sings, higher the further it stretches.
+const squishWorld = new THREE.Group();
+squishWorld.visible = false;
+scene.add(squishWorld);
+const SQUISH_BG = new THREE.Color(0x8d93ad);
+const squishEnv = (() => {
+  const pm = new THREE.PMREMGenerator(renderer), env = pm.fromScene(new THREE.RoomEnvironment(), 0.04).texture;
+  pm.dispose();
+  return env;
+})();
+// a calm gradient that ripples out in rings from loud hits, tinted by the blob that was hit
+const sqRipples = Array.from({ length: 4 }, () => ({ t0: -10, color: new THREE.Color() }));
+let sqRippleIdx = 0;
+const sqBackdrop = new THREE.Mesh(new THREE.SphereGeometry(60, 48, 24), new THREE.ShaderMaterial({
+  side: THREE.BackSide, depthWrite: false,
+  uniforms: {
+    u_axis: { value: V(0, 0, -1) }, u_time: { value: 0 },
+    u_t0: { value: [-10, -10, -10, -10] }, u_col: { value: sqRipples.map(r => r.color) },
+  },
+  vertexShader: `varying vec3 v_dir; void main () { v_dir = normalize(position); gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+  fragmentShader: `varying vec3 v_dir; uniform vec3 u_axis; uniform float u_time; uniform float u_t0[4]; uniform vec3 u_col[4];
+    void main () {
+      vec3 d = normalize(v_dir);
+      float a = acos(clamp(dot(d, u_axis), -1.0, 1.0));
+      vec3 top = vec3(0.80, 0.82, 0.90), mid = vec3(0.66, 0.68, 0.79), low = vec3(0.42, 0.42, 0.55);
+      vec3 c = mix(mid, top, smoothstep(0.0, 0.6, d.y));
+      c = mix(c, low, smoothstep(0.0, -0.4, d.y));
+      c *= 1.0 - 0.18 * smoothstep(0.2, 1.4, a);
+      for (int i = 0; i < 4; i++) {
+        float age = u_time - u_t0[i];
+        if (age < 0.0 || age > 1.6) continue;
+        float r = 0.15 + age * 1.4, x = a - r, ring = exp(-pow(x * 5.0, 2.0)) * pow(0.5 + 0.5 * cos(x * 55.0), 3.0);
+        c = mix(c, u_col[i], clamp(ring * (1.0 - age / 1.6) * 0.4, 0.0, 1.0));
+      }
+      gl_FragColor = linearToOutputTexel(vec4(pow(c, vec3(2.2)), 1.0));
+    }`,
+}));
+squishWorld.add(sqBackdrop);
+const sqFloor = new THREE.Mesh(new THREE.PlaneGeometry(40, 40), new THREE.ShadowMaterial({ opacity: 0.22 }));
+sqFloor.rotation.x = -Math.PI / 2; sqFloor.receiveShadow = true;
+squishWorld.add(sqFloor);
+const sqHemi = new THREE.HemisphereLight(0xe8ecff, 0x6a6080, 0.5 * LI);
+const sqKey = new THREE.DirectionalLight(0xfff4ea, 1.4 * LI);
+sqKey.position.set(-4, 9, 6); sqKey.castShadow = true;
+sqKey.shadow.mapSize.set(2048, 2048); sqKey.shadow.radius = 6; sqKey.shadow.bias = -0.0005;
+Object.assign(sqKey.shadow.camera, { left: -8, right: 8, top: 8, bottom: -8, near: 1, far: 30 });
+const sqRim = new THREE.DirectionalLight(0xcfe0ff, 1.1 * LI);
+sqRim.position.set(5, 4, -7);
+sqKey.shadow.camera.updateProjectionMatrix();
+squishWorld.add(sqHemi, sqKey, sqRim);
+
+// one template body shared by every blob: a gummy drop, flat underneath, with its spring network
+const SQ = (() => {
+  const g = THREE.mergeVertices(new THREE.IcosahedronGeometry(1, 4).deleteAttribute('normal').deleteAttribute('uv'));
+  const p = g.attributes.position, n = p.count;
+  let minY = Infinity;
+  for (let i = 0; i < n; i++) {
+    const x = p.getX(i), y = p.getY(i), z = p.getZ(i), widen = 1 + 0.14 * (1 - (y + 1) / 2);
+    let yy = y * 0.94;
+    if (yy < -0.55) yy = -0.55 + (yy + 0.55) * 0.15;
+    p.setXYZ(i, x * widen, yy, z * widen);
+    minY = Math.min(minY, yy);
+  }
+  for (let i = 0; i < n; i++) p.setY(i, p.getY(i) - minY);
+  g.computeVertexNormals();
+  const idx = g.index.array, sets = Array.from({ length: n }, () => new Set());
+  for (let i = 0; i < idx.length; i += 3) for (let k = 0; k < 3; k++) { const a = idx[i + k], b = idx[i + (k + 1) % 3]; sets[a].add(b); sets[b].add(a); }
+  const start = new Int32Array(n + 1), list = [];
+  sets.forEach((s, i) => { start[i] = list.length; list.push(...s); });
+  start[n] = list.length;
+  const nbr = Int32Array.from(list), rest = Float32Array.from(p.array), lap = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) {
+    const c = start[i + 1] - start[i];
+    for (let k = 0; k < 3; k++) {
+      let s = 0;
+      for (let j = start[i]; j < start[i + 1]; j++) s += rest[nbr[j] * 3 + k];
+      lap[i * 3 + k] = s / c - rest[i * 3 + k];
+    }
+  }
+  // spots along the top that a pearl can press, low notes on the left to high on the right
+  const normal = Float32Array.from(g.attributes.normal.array), slots = [];
+  for (let s = 0; s < 25; s++) {
+    const u = s / 24, d = V(-0.78 + 1.56 * u, 0.9, 0.38).normalize();
+    let best = 0, bd = -2;
+    for (let i = 0; i < n; i++) { const dot = normal[i * 3] * d.x + normal[i * 3 + 1] * d.y + normal[i * 3 + 2] * d.z; if (dot > bd) { bd = dot; best = i; } }
+    slots.push(best);
+  }
+  return { geo: g, n, nbr, start, rest, lap, normal, slots };
+})();
+const GUMMY = [0xd0102a, 0x1f9e2c, 0xff6a00, 0x6a1fb8, 0xf2c200, 0x0a7fd8];
+const BLOB_SPOT = 1.9;   // spacing between blobs
+const blobs = [];
+let sqHits = 0, sqLastRipple = -10;
+const pearlGeo = new THREE.SphereGeometry(0.11, 24, 16);
+const pearlMat = new THREE.MeshPhysicalMaterial({ color: 0xf4f0ff, metalness: 0.15, roughness: 0.12, clearcoat: 1, iridescence: 1, iridescenceIOR: 1.6, iridescenceThicknessRange: [180, 620] });
+
+function makeBlob(i, info) {
+  const geo = new THREE.BufferGeometry();
+  const pos = Float32Array.from(SQ.rest);
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3).setUsage(THREE.DynamicDrawUsage));
+  geo.setAttribute('normal', new THREE.BufferAttribute(Float32Array.from(SQ.normal), 3).setUsage(THREE.DynamicDrawUsage));
+  geo.setIndex(SQ.geo.index);
+  geo.boundingSphere = new THREE.Sphere(V(0, 0.8, 0), 2.2);
+  const color = new THREE.Color(GUMMY[i % GUMMY.length]);
+  const mat = new THREE.MeshPhysicalMaterial({
+    color, transmission: 0.82, thickness: 1.4, attenuationColor: color, attenuationDistance: 0.55, ior: 1.45,
+    roughness: 0.14, clearcoat: 1, clearcoatRoughness: 0.05, specularIntensity: 1, emissive: color, emissiveIntensity: 0,
+  });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.castShadow = true;
+  squishWorld.add(mesh);
+  return {
+    i, mesh, geo, pos, vel: new Float32Array(pos.length), off: new Float32Array(pos.length), dent: new Float32Array(SQ.n), color,
+    q: 0, qv: 0, heat: 0, pokes: [], pearls: [], voices: [], ...info,
+  };
+}
+function clearBlobs() {
+  for (const b of blobs) {
+    squishWorld.remove(b.mesh); b.geo.dispose(); b.mesh.material.dispose();
+    for (const p of b.pearls) squishWorld.remove(p.mesh);
+  }
+  blobs.length = 0;
+}
+
+// parts: each gets its own blob (up to six); further parts share the blob nearest their register
+function defaultSquishMap(entry) {
+  entry.squishMap = {};
+  const parts = entry.parts.filter(pt => guessKind(pt) !== 'off').sort((a, b) => b.count - a.count);
+  const own = [];
+  for (const pt of parts) {
+    const drum = pt.ch === 9, mid = (pt.lo + pt.hi) / 2;
+    const twin = drum ? own.find(o => o.drum) : null;
+    if (!twin && own.length < 6) { own.push({ drum, mid }); entry.squishMap[pt.key] = 'b' + (own.length - 1); continue; }
+    let best = 0, bd = Infinity;
+    own.forEach((o, k) => { const d = o.drum !== drum ? 999 : Math.abs(o.mid - mid); if (d < bd) { bd = d; best = k; } });
+    entry.squishMap[pt.key] = 'b' + best;
+  }
+  for (const pt of entry.parts) if (!entry.squishMap[pt.key]) entry.squishMap[pt.key] = 'off';
+}
+function buildBlobs(entry) {
+  clearBlobs();
+  const ids = [...new Set(Object.values(entry.squishMap).filter(v => v !== 'off'))];
+  const specs = ids.map(id => {
+    const parts = entry.parts.filter(pt => entry.squishMap[pt.key] === id);
+    const drum = parts.some(pt => pt.ch === 9);
+    const lo = Math.min(...parts.map(pt => pt.lo)), hi = Math.max(...parts.map(pt => pt.hi));
+    return { id, drum, lo, hi, mid: drum ? 0 : (lo + hi) / 2, name: parts.map(pt => pt.name).join(' + ') };
+  }).sort((a, b) => a.mid - b.mid);
+  if (!specs.length) specs.push({ id: 'b0', drum: false, lo: 48, hi: 84, mid: 66, name: 'Live' });
+  const n = specs.length;
+  specs.forEach((s, k) => {
+    const b = makeBlob(k, s);
+    // low parts get bigger, rounder bodies; the row curves gently back at the ends
+    const size = s.drum ? 1.05 : clamp(1.15 - (s.mid - 40) / 90, 0.75, 1.15), x = (k - (n - 1) / 2) * BLOB_SPOT;
+    b.size = size;
+    b.mesh.scale.setScalar(size * 0.8);
+    b.mesh.position.set(x, 0, -Math.pow(Math.abs(x) / 3, 2) * 1.2);
+    blobs.push(b);
+  });
+  const width = (n - 1) * BLOB_SPOT;
+  squishMachine.wide = Math.max(4.5, width * 0.95 + 2.6);
+}
+const blobById = id => blobs.find(b => b.id === id);
+// which pressing spot a note uses: its place in the blob's range, low on the left
+function slotFor(b, note) {
+  const u = b.hi > b.lo ? (note - b.lo) / (b.hi - b.lo) : 0.5;
+  return SQ.slots[Math.round(clamp(u, 0, 1) * (SQ.slots.length - 1))];
+}
+function pokeAt(b, vi, t, hold, vel, radius = 0.42) {
+  const r = SQ.rest, cx = r[vi * 3], cy = r[vi * 3 + 1], cz = r[vi * 3 + 2], idx = [], w = [];
+  for (let i = 0; i < SQ.n; i++) {
+    const d = Math.hypot(r[i * 3] - cx, r[i * 3 + 1] - cy, r[i * 3 + 2] - cz);
+    if (d < radius) { idx.push(i); w.push(Math.pow(Math.cos((d / radius) * Math.PI / 2), 2)); }
+  }
+  const depth = (0.12 + 0.22 * vel) * vary(0.3);
+  const poke = { vi, t, hold: Math.max(0.07, hold), depth, vel, idx, w, kicked: false };
+  b.pokes.push(poke);
+  // the pearl that does the pressing, falling in from above so it lands exactly at t
+  let pearl = b.pearls.find(p => !p.busy);
+  if (!pearl) { pearl = { mesh: new THREE.Mesh(pearlGeo, pearlMat) }; pearl.mesh.castShadow = true; squishWorld.add(pearl.mesh); b.pearls.push(pearl); }
+  Object.assign(pearl, { busy: true, poke, from: V((Math.random() - 0.5) * 0.6, 1.6 + Math.random() * 0.5, 0.2 + Math.random() * 0.4) });
+  pearl.mesh.visible = false;
+  return poke;
+}
+
+// ---------- the voice: a wet, vowel-like tone shaped by the blob ----------
+function squishVoice(b, midi, t, vel, d) {
+  const f = mtof(midi), len = d != null ? Math.max(0.12, d) : 0.22, end = t + len;
+  const out = actx.createGain(), pan = actx.createStereoPanner ? actx.createStereoPanner() : null;
+  if (pan) { pan.pan.value = clamp(b.mesh.position.x / 5, -0.8, 0.8); out.connect(pan).connect(master); } else out.connect(master);
+  const src = actx.createGain(), f1 = filt('bandpass', 400, 5), f2 = filt('bandpass', 1000, 7), body = filt('lowpass', f * 3, 0.7);
+  src.connect(f1).connect(out); src.connect(f2).connect(out); src.connect(body).connect(out);
+  const o1 = osc('triangle', f, t, len + 0.35, src), o2 = actx.createOscillator(), og = actx.createGain();
+  o2.type = 'sawtooth'; o2.frequency.value = f * 1.003; og.gain.value = 0.35;
+  o2.connect(og).connect(src); o2.start(t); o2.stop(end + 0.4);
+  const peak = 0.22 * (0.3 + 0.7 * vel);
+  out.gain.setValueAtTime(0.0001, t);
+  out.gain.exponentialRampToValueAtTime(peak, t + 0.018);
+  out.gain.setTargetAtTime(peak * 0.7, t + 0.05, 0.1);
+  out.gain.setValueAtTime(peak * 0.7, end);
+  out.gain.exponentialRampToValueAtTime(0.0001, end + 0.3);
+  b.voices.push({ t, end: end + 0.3, f1, f2, o1, o2 });
+}
+// the wet slap of contact: noise through a band that sweeps down
+function squelch(b, t, vel) {
+  const bp = filt('bandpass', 2400, 2.5), g = out(t, 0.16 * vel, 0.14);
+  bp.frequency.setValueAtTime(2400 * vary(0.3), t);
+  bp.frequency.exponentialRampToValueAtTime(320, t + 0.11);
+  bp.connect(g); noise(t, 0.14, bp);
+}
+// a little pop as a held press lets go
+function pop(t, vel, f = 500) {
+  const g = out(t, 0.1 * vel, 0.07);
+  osc('sine', f, t, 0.07, g, f * 2.6);
+}
+function sqNote(b, note, hitAbs, vel, dur, drumNote) {
+  if (b.drum) {
+    const piece = drumNote != null ? (KIT_NOTE[drumNote] || pieceFromPitch(drumNote)) : pieceFromPitch(note);
+    if (piece === 'kick') { b.kicks = (b.kicks || []); b.kicks.push({ t: hitAbs, vel }); }
+    const u = { kick: 0.5, snare: 0.62, floor: 0.2, tomMid: 0.35, tomHi: 0.5, hat: 0.9, hatPedal: 0.85, hatOpen: 0.9, crash: 0.05, ride: 0.98 }[piece] ?? 0.5;
+    const vi = SQ.slots[Math.round(u * (SQ.slots.length - 1))];
+    pokeAt(b, vi, hitAbs, piece === 'crash' || piece === 'hatOpen' ? 0.25 : 0.06, vel, piece === 'kick' ? 0.75 : 0.36);
+    if (soundOn && actx) { playDrum(piece, hitAbs, vel); squelch(b, actx.currentTime + Math.max(0, hitAbs - nowSec()), vel * 0.5); }
+    return;
+  }
+  const d = FX.hold && dur ? dur : null;
+  pokeAt(b, slotFor(b, note), hitAbs, d != null ? d : 0.1, vel);
+  if (!soundOn || !actx) return;
+  const t = actx.currentTime + Math.max(0, hitAbs - nowSec());
+  squelch(b, t, vel);
+  if (!kitPlay(note, t, vel, d)) squishVoice(b, note, t, vel, d);
+  if (d != null && d > 0.3) pop(t + d, vel, mtof(note) * 0.5);
+}
+
+// ---------- simulation ----------
+const SPRING = 150, DAMP = 5.5, SMOOTH = 55, Q_SPRING = 90, Q_DAMP = 3.2;
+function stepBlob(b, now, dt) {
+  const { pos, vel, off, dent } = b, r = SQ.rest, lap = SQ.lap, nbr = SQ.nbr, st = SQ.start, nrm = SQ.normal, n = SQ.n;
+  off.fill(0); dent.fill(0);
+  let load = 0;
+  b.pokes = b.pokes.filter(p => now < p.t + p.hold + 1.5);
+  for (const p of b.pokes) {
+    if (now < p.t) continue;
+    const age = now - p.t, amt = age < 0.035 ? age / 0.035 : age < p.hold ? 1 : 0;
+    if (!p.kicked) {
+      p.kicked = true;
+      // the impact: a shove into the surface around the contact, a jolt through the whole body, a light and a ripple
+      for (let k = 0; k < p.idx.length; k++) { const i = p.idx[k]; for (let c = 0; c < 3; c++) vel[i * 3 + c] -= nrm[i * 3 + c] * p.w[k] * 2.2 * p.vel; }
+      b.qv += 0.45 * p.vel * vary(0.4); b.heat += p.vel; sqHits++; grooveHit(p.vel);
+      const wp = b.mesh.localToWorld(V(pos[p.vi * 3], pos[p.vi * 3 + 1], pos[p.vi * 3 + 2]));
+      flashAt(wp, b.color, p.vel, 2.4, 8, 0.5);
+      if (p.vel > 0.7 && now - sqLastRipple > 0.7) {
+        sqLastRipple = now;
+        const rp = sqRipples[sqRippleIdx++ % sqRipples.length];
+        rp.t0 = now; rp.color.copy(b.color).lerp(new THREE.Color(1, 1, 1), 0.35);
+      }
+    }
+    if (!amt) continue;
+    load += p.depth * amt;
+    for (let k = 0; k < p.idx.length; k++) dent[p.idx[k]] += p.depth * amt * p.w[k];
+  }
+  // presses that overlap saturate instead of adding up, so a busy blob dents deeper without caving in
+  for (let i = 0; i < SQ.n; i++) if (dent[i]) { const s = 0.32 * (1 - Math.exp(-dent[i] / 0.32)); for (let c = 0; c < 3; c++) off[i * 3 + c] -= nrm[i * 3 + c] * s; }
+  load = 0.16 * (1 - Math.exp(-load * 2.5));
+  if (b.kicks) {
+    for (const k of b.kicks) if (now >= k.t && !k.done) { k.done = true; b.qv += 1.2 * k.vel; }
+    b.kicks = b.kicks.filter(k => !k.done);
+  }
+  if (b.pull) for (let k = 0; k < b.pull.idx.length; k++) { const i = b.pull.idx[k], w = b.pull.w[k]; off[i * 3] += b.pull.v.x * w; off[i * 3 + 1] += b.pull.v.y * w; off[i * 3 + 2] += b.pull.v.z * w; }
+  // breathing with the beat
+  const g = grooveAmt(), breathe = g * 0.025 * beatPulse(groove.beats + b.i * 0.13, 4) * (0.4 + groove.energy);
+  const steps = 2, h = dt / steps;
+  for (let s = 0; s < steps; s++) {
+    // the whole body squashes and stretches on one spring, keeping its volume
+    b.qv += (Q_SPRING * (load + breathe - b.q) - Q_DAMP * b.qv) * h;
+    b.q = clamp(b.q + b.qv * h, -0.22, 0.28);
+    const sy = 1 - b.q, sxz = 1 / Math.sqrt(sy);
+    for (let i = 0; i < n; i++) {
+      const i3 = i * 3, c0 = st[i], c1 = st[i + 1], cnt = c1 - c0;
+      let ax = 0, ay = 0, az = 0;
+      for (let j = c0; j < c1; j++) { const q3 = nbr[j] * 3; ax += pos[q3]; ay += pos[q3 + 1]; az += pos[q3 + 2]; }
+      const tx = r[i3] * sxz + off[i3], ty = r[i3 + 1] * sy + off[i3 + 1], tz = r[i3 + 2] * sxz + off[i3 + 2];
+      vel[i3] += (SPRING * (tx - pos[i3]) + SMOOTH * (ax / cnt - pos[i3] - lap[i3]) - DAMP * vel[i3]) * h;
+      vel[i3 + 1] += (SPRING * (ty - pos[i3 + 1]) + SMOOTH * (ay / cnt - pos[i3 + 1] - lap[i3 + 1]) - DAMP * vel[i3 + 1]) * h;
+      vel[i3 + 2] += (SPRING * (tz - pos[i3 + 2]) + SMOOTH * (az / cnt - pos[i3 + 2] - lap[i3 + 2]) - DAMP * vel[i3 + 2]) * h;
+    }
+    for (let i = 0; i < pos.length; i++) pos[i] += vel[i] * h;
+    for (let i = 1; i < pos.length; i += 3) if (pos[i] < 0) { pos[i] = 0; if (vel[i] < 0) vel[i] = 0; }
+  }
+  b.geo.attributes.position.needsUpdate = true;
+  b.geo.computeVertexNormals();
+  b.heat *= Math.exp(-dt * 0.9);
+  b.mesh.material.emissiveIntensity = FX.lights ? Math.min(0.5, b.heat * 0.25) : 0;
+}
+// pearls fall on an accelerating path, press in for the note, then lift away and shrink
+const SQ_LEAD = 0.55;
+function updatePearls(b, now) {
+  for (const p of b.pearls) {
+    if (!p.busy) continue;
+    const k = p.poke, surf = b.mesh.localToWorld(V(b.pos[k.vi * 3], b.pos[k.vi * 3 + 1], b.pos[k.vi * 3 + 2]));
+    const nrm = V(SQ.normal[k.vi * 3], SQ.normal[k.vi * 3 + 1], SQ.normal[k.vi * 3 + 2]);
+    const contact = surf.addScaledVector(nrm, 0.11);
+    const u = (now - (k.t - SQ_LEAD)) / SQ_LEAD, up = now - (k.t + k.hold);
+    p.mesh.visible = u >= 0 && up < 0.45;
+    if (!p.mesh.visible) { if (up >= 0.45) p.busy = false; continue; }
+    if (u < 1) { p.mesh.position.copy(contact).add(p.from.clone().multiplyScalar(1 - u * u)); p.mesh.scale.setScalar(Math.min(1, u * 3)); }
+    else if (up < 0) { p.mesh.position.copy(contact); p.mesh.scale.setScalar(1); }
+    else { const e = up / 0.45; p.mesh.position.copy(contact).add(V(0, e * 1.2, 0)); p.mesh.scale.setScalar(1 - e); }
+  }
+}
+// the vowel opens as the body stretches and closes as it squashes; the pitch bends with the wobble
+function shapeVoices(b) {
+  if (!actx) return;
+  const now = actx.currentTime;
+  b.voices = b.voices.filter(v => now < v.end);
+  const open = clamp(0.55 - b.q * 3, 0, 1), bend = clamp(-b.qv * 45, -120, 120);
+  for (const v of b.voices) {
+    if (now < v.t) continue;
+    v.f1.frequency.setTargetAtTime(260 + 560 * open, now, 0.025);
+    v.f2.frequency.setTargetAtTime(760 + 620 * open, now, 0.025);
+    v.o1.detune.setTargetAtTime(bend, now, 0.02); v.o2.detune.setTargetAtTime(bend, now, 0.02);
+  }
+}
+
+// ---------- pull a blob to make it sing ----------
+const sqRay = new THREE.Raycaster(), sqNdc = new THREE.Vector2(), PENTA = [0, 2, 4, 7, 9];
+let grab = null;
+function rayFrom(e) {
+  const r = canvas.getBoundingClientRect();
+  sqNdc.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+  sqRay.setFromCamera(sqNdc, camera);
+  return sqRay.ray;
+}
+canvas.addEventListener('pointerdown', e => {
+  if (machine !== squishMachine) return;
+  rayFrom(e);
+  const hit = sqRay.intersectObjects(blobs.map(b => b.mesh))[0];
+  if (!hit) return;
+  e.stopImmediatePropagation();
+  canvas.setPointerCapture(e.pointerId);
+  const b = blobs.find(x => x.mesh === hit.object), local = b.mesh.worldToLocal(hit.point.clone());
+  let vi = hit.face.a, bd = Infinity;
+  for (const i of [hit.face.a, hit.face.b, hit.face.c]) { const d = local.distanceTo(V(SQ.rest[i * 3], SQ.rest[i * 3 + 1], SQ.rest[i * 3 + 2])); if (d < bd) { bd = d; vi = i; } }
+  const r = SQ.rest, idx = [], w = [], R = 1.2;
+  for (let i = 0; i < SQ.n; i++) {
+    const d = Math.hypot(r[i * 3] - r[vi * 3], r[i * 3 + 1] - r[vi * 3 + 1], r[i * 3 + 2] - r[vi * 3 + 2]);
+    if (d < R) { idx.push(i); w.push(Math.exp(-4 * (d / R) * (d / R)) * (1 - d / R)); }   // a wide, smooth falloff so a pull stretches like taffy
+  }
+  const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(camera.getWorldDirection(V(0, 0, 0)).negate(), hit.point);
+  b.pull = { idx, w, v: V(0, 0, 0) };
+  grab = { b, plane, start: hit.point.clone(), base: b.drum ? 48 : Math.round(b.lo || 55), step: -1, voice: null };
+  ensureAudio(); if (!soundOn) { soundOn = true; syncSound(); }
+  b.qv += 0.6; b.heat += 0.5;
+}, { capture: true });
+canvas.addEventListener('pointermove', e => {
+  if (!grab) return;
+  e.stopImmediatePropagation();
+  const p = rayFrom(e).intersectPlane(grab.plane, V(0, 0, 0));
+  if (!p) return;
+  const d = p.sub(grab.start);
+  if (d.length() > 1.4) d.setLength(1.4);
+  const s = grab.b.mesh.scale.x;
+  grab.b.pull.v.copy(d).divideScalar(s);
+  // the further it stretches the higher it sings, on a pentatonic ladder so any pull sounds musical
+  const step = Math.min(14, Math.floor(d.length() / 0.1));
+  if (step !== grab.step) {
+    grab.step = step;
+    const midi = grab.base + 12 * Math.floor(step / 5) + PENTA[step % 5];
+    if (!grab.voice) { squishVoice(grab.b, midi, actx.currentTime + 0.01, 0.7, 30); grab.voice = grab.b.voices[grab.b.voices.length - 1]; }
+    else for (const o of [grab.voice.o1, grab.voice.o2]) o.frequency.setTargetAtTime(mtof(midi) * (o === grab.voice.o2 ? 1.003 : 1), actx.currentTime, 0.04);
+  }
+}, { capture: true });
+function letGo(e) {
+  if (!grab) return;
+  if (e) e.stopImmediatePropagation();
+  const b = grab.b, t = actx.currentTime;
+  b.pull = null; b.qv -= 1.2; b.heat += 0.6;
+  if (grab.voice) {
+    const v = grab.voice;
+    v.end = t + 0.3;
+    for (const o of [v.o1, v.o2]) { try { o.stop(t + 0.35); } catch { /* already stopping */ } }
+    pop(t, 0.8, 380);
+    squelch(b, t, 0.7);
+  }
+  grab = null;
+}
+canvas.addEventListener('pointerup', letGo, { capture: true });
+canvas.addEventListener('pointercancel', letGo, { capture: true });
+
+const squishMachine = {
+  id: 'squish', label: 'Squish', blurb: 'Every note drops a pearl that presses into a gummy blob right on the beat. Drag a blob to pull it and make it sing; drag the background to orbit.',
+  wide: 7,
+  lead: () => SQ_LEAD + 0.1,
+  stage: () => ({ env: squishEnv, bg: SQUISH_BG, fog: null, backdrop: sqBackdrop }),
+  enter() {
+    squishWorld.visible = true; scene.background = SQUISH_BG; scene.fog = null; scene.environment = squishEnv; setBloom(0.35, 0.45, 1.6);
+    Object.assign(orbit, { theta: 0, phi: 0.28, r: this.wide }); orbit.target.set(0, 0.6, 0);
+  },
+  exit() { letGo(); squishWorld.visible = false; scene.environment = null; },
+  load(entry) {
+    if (!entry.squishMap) defaultSquishMap(entry);
+    buildBlobs(entry); preloadSamples();
+    orbit.r = this.wide;
+  },
+  refresh(entry) { buildBlobs(entry); },
+  schedule(e, hitAbs, entry) {
+    const b = blobById(entry.squishMap[e.part]);
+    if (b) sqNote(b, e.note, hitAbs, e.vel / 127, e.dur, e.ch === 9 ? e.note : null);
+  },
+  live(note, vel, ch) {
+    if (!blobs.length) return false;
+    const mel = blobs.filter(b => !b.drum), drum = blobs.find(b => b.drum);
+    if ((ch === 9 || !mel.length) && drum) { sqNote(drum, note, nowSec() + SQ_LEAD + 0.05, vel / 127, 0.1, note); return true; }
+    const b = mel.reduce((m, x) => (Math.abs(x.mid - note) < Math.abs(m.mid - note) ? x : m), mel[0]);
+    sqNote(b, note, nowSec() + SQ_LEAD + 0.05, vel / 127, 0.3);
+    return true;
+  },
+  update(now, dt) {
+    for (const b of blobs) { stepBlob(b, now, dt); updatePearls(b, now); shapeVoices(b); }
+    const u = sqBackdrop.material.uniforms;
+    u.u_time.value = now;
+    sqRipples.forEach((r, k) => { u.u_t0.value[k] = r.t0; });
+    camera.getWorldDirection(u.u_axis.value);
+  },
+  // auto camera: the whole row, close on the busiest blob, low and heroic, or from above
+  pickShot() {
+    const busy = blobs.reduce((m, b) => (!m || b.heat > m.heat ? b : m), null), roll = Math.random();
+    if (!busy || busy.heat < 0.4 || roll < 0.3) return { theta: (Math.random() - 0.5) * 0.5, phi: 0.28, r: this.wide, target: V(0, 0.55, 0), drift: 0.02 };
+    const bp = busy.mesh.position;
+    if (roll < 0.75) return { theta: (Math.random() - 0.5) * 0.8, phi: 0.22, r: 2.2 + busy.size, target: V(bp.x, 0.45, bp.z), drift: 0.03 };
+    if (roll < 0.9) return { theta: (Math.random() - 0.5) * 0.6, phi: 0.04, r: this.wide * 0.6, target: V(0, 0.7, 0), drift: 0.02 };
+    return { theta: 0, phi: 1.1, r: this.wide * 0.8, target: V(0, 0, 0), drift: 0.03 };
+  },
+  inFlight: () => blobs.reduce((s, b) => s + b.pearls.filter(p => p.busy).length, 0),
+  hits: () => sqHits,
+};
+function renderSquishParts(entry) {
+  const list = $('#partList');
+  list.innerHTML = '';
+  const names = blobs.map((b, k) => [b.id, `Blob ${k + 1}${b.drum ? ' (drums)' : ''}`]);
+  const free = ['b0', 'b1', 'b2', 'b3', 'b4', 'b5'].find(id => !blobById(id));
+  entry.parts.forEach((pt, i) => list.appendChild(partRow(pt, i,
+    [...names, ...(free ? [[free, '+ New blob']] : []), ['off', 'Off']],
+    entry.squishMap[pt.key], v => { entry.squishMap[pt.key] = v; if (entry === current) buildBlobs(entry); renderSquishParts(entry); })));
+  $('#parts').hidden = !entry.parts.length;
+  const off = entry.parts.filter(p => entry.squishMap[p.key] === 'off').length;
+  $('#partSummary').textContent = `${entry.parts.length} part${entry.parts.length > 1 ? 's' : ''} on ${blobs.length} blob${blobs.length === 1 ? '' : 's'}` + (off ? ` · ${off} off` : '') + ' (click to change)';
+}
+
+const MACHINES = { pipe: pipeMachine, doll: dollMachine, squish: squishMachine };
 let machine = pipeMachine;
 
 // ---------- transport ----------
@@ -2840,7 +3301,7 @@ function fmt(t) { t = Math.max(0, t); return Math.floor(t / 60) + ':' + String(M
 const NOTE_NAMES = ['C', 'C♯', 'D', 'D♯', 'E', 'F', 'F♯', 'G', 'G♯', 'A', 'A♯', 'B'];
 const noteName = n => NOTE_NAMES[n % 12] + (Math.floor(n / 12) - 1);
 
-function renderParts(entry) { return machine === dollMachine ? renderDollParts(entry) : renderPipeParts(entry); }
+function renderParts(entry) { return machine === dollMachine ? renderDollParts(entry) : machine === squishMachine ? renderSquishParts(entry) : renderPipeParts(entry); }
 function partRow(pt, i, options, value, onchange) {
   const row = document.createElement('div');
   row.className = 'part';
@@ -3027,6 +3488,7 @@ function toggleKind(k) {
 $('#autoAssign').onclick = () => {
   if (!current) return;
   if (machine === dollMachine) defaultDollMap(current);
+  else if (machine === squishMachine) { defaultSquishMap(current); buildBlobs(current); }
   else { current.manual = {}; assignParts(current); buildLayout(current.specs); }
   renderParts(current);
   setStatus(`Every part of ${current.name} is mapped automatically again.`);
@@ -3173,7 +3635,7 @@ $('#kitRec').onclick = async () => {
 renderSound();
 loadTakes();
 // stage light scales every stage lamp on both machines; glow strength scales the bloom
-const STAGE_LIGHTS = [[pipeHemi, 0.35], [sun, 0.8], [core, 0.6], [dollHemi, 0.3], [rimPink, 0.8], [rimWhite, 0.5], [fill, 0.35]];
+const STAGE_LIGHTS = [[pipeHemi, 0.35], [sun, 0.8], [core, 0.6], [dollHemi, 0.3], [rimPink, 0.8], [rimWhite, 0.5], [fill, 0.35], [sqHemi, 0.5], [sqKey, 1.4], [sqRim, 1.1]];
 // ---------- environments: Poly Haven HDRIs (CC0) that light and reflect on either machine ----------
 const ENVS = [
   ['builtin', 'Built-in'],
@@ -3220,19 +3682,17 @@ function applyEnvIntensity() {
   scene.traverse(o => { const m = o.material; if (m && m.isMeshStandardMaterial) m.envMapIntensity = k; });
 }
 function applyEnvironment() {
-  const doll = machine === dollMachine, want = ENV_STATE.name;
+  const want = ENV_STATE.name, st = machine.stage();
   const builtIn = () => {
-    scene.environment = doll ? studioEnv : null;
-    scene.background = doll ? DOLL_BG : PIPE_BG;
-    scene.fog = doll ? null : PIPE_FOG;
-    backdrop.visible = true;
+    scene.environment = st.env; scene.background = st.bg; scene.fog = st.fog;
+    if (st.backdrop) st.backdrop.visible = true;
   };
   if (want === 'builtin') { builtIn(); applyEnvIntensity(); return; }
   loadEnv(want).then(e => {
     if (ENV_STATE.name !== want) return;
     builtIn();
     scene.environment = e.env;
-    if (ENV_STATE.backdrop) { scene.background = e.bg; scene.fog = null; backdrop.visible = false; }
+    if (ENV_STATE.backdrop) { scene.background = e.bg; scene.fog = null; if (st.backdrop) st.backdrop.visible = false; }
     applyEnvIntensity();
   }).catch(err => {
     setStatus(`Couldn't load that environment: ${err.message}. Using the built-in one.`);
