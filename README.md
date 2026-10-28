@@ -30,7 +30,8 @@ You can also open the page any other way and drag `.mid` files onto it. Sampled 
   - **Reverb**: a room around the sound
   - **Ball returns**: balls drop into catchers and roll back to the launcher
   - **Auto camera**: follows the busiest instrument; drag or scroll to take over for a few seconds
-  - **Stage light** and **Glow strength** dials
+  - **Groove**: everything moves with the beat (from the MIDI tempo map). The doll dances in styles picked from how busy the music is (chill sway, nod, headbang, shoulder shimmy, off-beat weirdness); Pipe Rig stations bob, tall ones sway, and a wave sometimes travels around the ring. Every note varies a little: ball arcs, landing spots and bounces, and the doll's stroke height, angle and spot, with runs of repeats rising and falling like real accents
+  - **Stage light**, **Glow strength** and **Groove amount** dials
   - **Environment**: light and reflect either machine with a Poly Haven HDRI (soft studio, neon studio, moonlit trees, Venice sunset, warehouse); **Show as backdrop** puts it behind the stage
 - **Parts** — remap any MIDI part to a different instrument, or add a new one.
 - **Live** — a MIDI device or the keyboard (`A`–`;` marimba, `Z`–`M` bass, `1`–`8` drums), in delayed (full arcs) or instant mode.

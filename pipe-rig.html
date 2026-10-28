@@ -152,6 +152,7 @@ body.dropping #stage { outline: 3px dashed var(--copper); outline-offset: -12px;
     <span class="chips" id="fxChips" role="group" aria-label="Visual and sound effects"></span>
     <label class="dial" for="lightAmt">Stage light <input id="lightAmt" type="range" min="0.3" max="1.6" step="0.05"></label>
     <label class="dial" for="glowAmt">Glow strength <input id="glowAmt" type="range" min="0" max="2" step="0.05"></label>
+    <label class="dial" for="grooveAmt">Groove amount <input id="grooveAmt" type="range" min="0" max="2" step="0.05"></label>
     <label class="dial" for="envSel">Environment <select id="envSel"></select></label>
     <label class="check"><input type="checkbox" id="envBg"> Show as backdrop</label>
   </div>
@@ -201,10 +202,11 @@ const FX_INFO = [
   ['reverb', 'Reverb', 'A room around the sound'],
   ['returns', 'Ball returns', 'Pipe Rig balls drop into catchers and roll back to the launcher'],
   ['director', 'Auto camera', 'The camera follows the busiest instrument; drag or scroll to take over for a while'],
+  ['groove', 'Groove', 'Bodies and instruments move with the beat, and repeated notes are played a little differently each time'],
 ];
 const FX = Object.fromEntries(FX_INFO.map(([k]) => [k, true]));
 // two dials beside the switches: overall stage lighting and how strongly lit-up things glow
-const LEVELS = { light: 1, glow: 1 };
+const LEVELS = { light: 1, glow: 1, groove: 1 };
 try {
   const saved = JSON.parse(localStorage.getItem('pipeRig.levels'));
   if (saved) for (const k in LEVELS) if (typeof saved[k] === 'number') LEVELS[k] = saved[k];
@@ -672,7 +674,7 @@ function buildMarbleRun(st) {
       if (m.b.gateT < m.tDrop) m.b.gateT = m.tDrop;
       if (now < m.T) { const s = now - m.tDrop; p.set(m.b.x, ride(railY(m.b.x)) - 4.905 * s * s, 0); continue; }
       if (!m.hit) {
-        m.hit = true; hitCount++; st.heat += m.vel;
+        m.hit = true; hitCount++; st.heat += m.vel; grooveHit(m.vel);
         hitInst(m.b.inst, m.T, m.vel, m.dur);
         flashAt(g.localToWorld(tmpP.set(m.b.x, BAR_Y + 0.2, 0.1)), pitchColor(m.note), m.vel, 5);
       }
@@ -811,7 +813,7 @@ function buildOrgan(st) {
       if (rel >= -0.15 && rel < e.dur + 0.1) p.open = 1;
       if (rel >= 0 && rel < e.dur) { sounding++; p.target = Math.max(p.target, 0.6 + 0.6 * e.vel); }
       if (rel >= 0 && !e.started) {
-        e.started = true; hitCount++; st.heat += e.vel;
+        e.started = true; hitCount++; st.heat += e.vel; grooveHit(e.vel);
         flashAt(g.localToWorld(tmpP.set(p.x, CHEST + p.H, 0.15)), warm, e.vel, 6);
         if (puffs.length < 30) {
           const mesh = new THREE.Mesh(puffGeo, new THREE.MeshBasicMaterial({ color: 0xfff3dd, transparent: true, opacity: 0.5, depthWrite: false }));
@@ -876,7 +878,7 @@ function buildLaserLyre(st) {
       if (rel < 0 && rel > -0.28) b.charge = Math.max(b.charge, 1 + rel / 0.28);
       if (rel >= 0 && rel < e.dur) b.on = Math.max(b.on, 0.55 + 0.45 * e.vel);
       if (rel >= 0 && !e.started) {
-        e.started = true; hitCount++; st.heat += e.vel;
+        e.started = true; hitCount++; st.heat += e.vel; grooveHit(e.vel);
         flashAt(g.localToWorld(tmpP.set(b.x, Y0 + L * 0.5, 0.2)), b.col, e.vel, 7, 6);
       }
     }
@@ -998,7 +1000,7 @@ const TALL = new Set(['bass', 'harp', 'horns', 'springs', 'organ', 'laser']);
 const TUBE_R = 1.5, TUBE_DY = 0.22;
 
 let stations = [], stationById = {}, layoutObjs = [], insts = [], maxTau = 1.2;
-let selfLead = 0, layoutR = 9;   // the longest lead a self-driven station needs, and the ring radius
+let selfLead = 0, layoutR = 9, tower = null;   // the longest lead a self-driven station needs, and the ring radius
 
 function disposeTree(o) {
   o.traverse(c => {
@@ -1064,7 +1066,7 @@ function buildStation(spec, label, angle, R, baseY, ringIdx, edgeA = 0.2) {
   group.position.set(R * Math.cos(angle), baseY, R * Math.sin(angle));
   group.lookAt(0, baseY, 0);
   addObj(group);
-  const st = { spec, kind, group, routes: {}, pending: [], angle, R, heat: 0 };
+  const st = { spec, kind, group, routes: {}, pending: [], angle, R, heat: 0, baseQ: group.quaternion.clone(), baseY };
   st.note = (key, local, normal, inst, voice, jitter = 0, restitution = 0.5) => st.pending.push({ key, local, normal, inst, voice, jitter, restitution });
   kind.build(st);
   if (st.lead) selfLead = Math.max(selfLead, st.lead);
@@ -1145,6 +1147,7 @@ function buildLayout(specs) {
   const dome = new THREE.Mesh(new THREE.SphereGeometry(TUBE_R - 0.25, 32, 16, 0, Math.PI * 2, 0, Math.PI / 2), colMat);
   dome.position.y = towerTop; addObj(dome);
   core.position.y = towerTop + 1.5;
+  tower = { column, dome };
 
   // frame the camera and lights on whatever was built
   const outer = R + 2;
@@ -1183,12 +1186,14 @@ const tmp = V(0, 0, 0);
 
 function spawn(route, hitAbs, vel, dur = 0.3) {
   if (!route || balls.length >= MAX_BALLS) return;
-  const P = route.target.clone();
-  if (route.jitter) { P.x += (Math.random() - 0.5) * route.jitter; P.z += (Math.random() - 0.5) * route.jitter; }
-  const v0 = solveV0(route.mouth, P, route.tau, V(0, 0, 0));
+  // no two balls alike: each flies a slightly higher or flatter arc and lands a touch off center
+  const P = route.target.clone(), spot = (route.jitter || 0) + 0.06 * grooveAmt();
+  if (spot) { P.x += (Math.random() - 0.5) * spot; P.z += (Math.random() - 0.5) * spot; }
+  const tau = route.tau * vary(0.12);
+  const v0 = solveV0(route.mouth, P, tau, V(0, 0, 0));
   const mesh = new THREE.Mesh(ballGeo, route.ballMat);
-  mesh.castShadow = true; mesh.visible = false; pipeWorld.add(mesh);
-  balls.push({ route, P, v0, launch: hitAbs - route.tau, hit: hitAbs, vel, dur, mesh, phase: 0, launched: false, v: null, bounces: 0, fade: 0 });
+  mesh.castShadow = true; mesh.visible = false; mesh.rotation.set(Math.random() * 6, Math.random() * 6, 0); pipeWorld.add(mesh);
+  balls.push({ route, P, v0, tau, spin: (Math.random() - 0.5) * 20 * grooveAmt(), launch: hitAbs - tau, hit: hitAbs, vel, dur, mesh, phase: 0, launched: false, v: null, bounces: 0, fade: 0 });
   route.play(hitAbs, vel, dur);
 }
 function removeBall(i) { pipeWorld.remove(balls[i].mesh); balls.splice(i, 1); }
@@ -1212,11 +1217,12 @@ function updateBalls(now, dt) {
       if (now < b.hit) {
         const s = now - b.launch;
         b.mesh.position.copy(r.mouth).addScaledVector(b.v0, s).addScaledVector(G, 0.5 * s * s);
+        b.mesh.rotation.x += b.spin * dt;
         continue;
       }
       // impact: the instrument rings and a light flashes; the ball hops to its catcher or bounces free
-      hitCount++; r.st.heat += b.vel;
-      hitInst(r.inst, b.hit, b.vel, b.dur);
+      hitCount++; r.st.heat += b.vel; grooveHit(b.vel);
+      hitInst(r.inst, b.hit, Math.min(1, b.vel * vary(0.3)), b.dur);
       flashAt(tmp.copy(b.P).addScaledVector(r.normal, 0.3), r.color, b.vel, 6);
       if (FX.returns && r.st.ret) {
         b.phase = 2; b.hopT = 0.45 + 0.04 * b.P.distanceTo(r.st.ret.mouth);
@@ -1224,8 +1230,8 @@ function updateBalls(now, dt) {
         continue;
       }
       b.phase = 1;
-      const vin = tmp.copy(b.v0).addScaledVector(G, r.tau);
-      b.v = vin.clone().addScaledVector(r.normal, -(1 + r.restitution) * vin.dot(r.normal));
+      const vin = tmp.copy(b.v0).addScaledVector(G, b.tau);
+      b.v = vin.clone().addScaledVector(r.normal, -(1 + r.restitution * vary(0.4)) * vin.dot(r.normal));
       b.v.x += (Math.random() - 0.5) * 0.6; b.v.z += (Math.random() - 0.5) * 0.6;
       b.mesh.position.copy(b.P);
       stepFree(b, now - b.hit);
@@ -1305,17 +1311,23 @@ function parseMidi(buf) {
   const rank = e => e.tempo ? 0 : e.off ? 1 : 2;
   events.sort((x, y) => x.tick - y.tick || rank(x) - rank(y));
   let us = 500000, lastTick = 0, sec = 0;
-  const notes = [], open = {};
+  const notes = [], open = {}, tempo = [{ sec: 0, beat: 0, spb: 0.5 }];
   for (const e of events) {
     sec += (e.tick - lastTick) * us / 1e6 / div; lastTick = e.tick;
-    if (e.tempo) { us = e.tempo; continue; }
+    if (e.tempo) {
+      us = e.tempo;
+      // the tempo map: where each tempo starts, in seconds and in beats
+      const seg = { sec, beat: e.tick / div, spb: us / 1e6 };
+      if (sec === 0) tempo[0] = seg; else tempo.push(seg);
+      continue;
+    }
     const key = e.part + ':' + e.note;
     if (e.off) { const n = open[key] && open[key].shift(); if (n) n.dur = Math.max(0.03, sec - n.time); continue; }
     const n = { time: sec, note: e.note, vel: e.vel, ch: e.ch, part: e.part, dur: 0.5 };
     notes.push(n);
     (open[key] = open[key] || []).push(n);
   }
-  return { notes, parts: buildParts(notes, key => trackNames[+key.split(':')[0]] || 'Track ' + (+key.split(':')[0] + 1), programs) };
+  return { notes, tempo, parts: buildParts(notes, key => trackNames[+key.split(':')[0]] || 'Track ' + (+key.split(':')[0] + 1), programs) };
 }
 
 // one "part" per track+channel pair, with what's needed to pick its instrument
@@ -1457,9 +1469,77 @@ function demoEntry() {
   }
   notes.sort((x, y) => x.time - y.time);
   const names = { 0: 'Marimba arpeggio', 1: 'Bass line', 2: 'Vibes chords', 3: 'Water bell sparkle', 4: 'Horn stabs', 5: 'Organ chords', 6: 'Laser lead', 7: 'Marble runs', 8: 'Spring plucks', 9: 'Drums' };
-  return makeEntry('Demo groove', notes, buildParts(notes, k => names[k.split(':')[1]], { 0: 12, 1: 33, 2: 11, 3: 14, 4: 61, 5: 19, 6: 81, 7: 13, 8: 24 }));
+  return Object.assign(makeEntry('Demo groove', notes, buildParts(notes, k => names[k.split(':')[1]], { 0: 12, 1: 33, 2: 11, 3: 14, 4: 61, 5: 19, 6: 81, 7: 13, 8: 24 })), { tempo: [{ sec: 0, beat: 0, spb: b }] });
 }
 const DEMO = demoEntry();
+
+
+// ---------- groove: the song's beat, how busy the music is, and a dance style that follows it ----------
+// Both machines read this: bodies and stations move with the beat, and every note gets small variations.
+const groove = { energy: 0, beats: 0, bar: -1, bpm: 104, style: 'sway', w: { still: 0, sway: 1, nod: 0, bang: 0, shimmy: 0, weird: 0 } };
+// beats since the song started, read from its tempo map; with no song playing the beat runs on at the last tempo
+function beatNow(now) {
+  if (song && song.entry.tempo) {
+    const t = now - song.start, map = song.entry.tempo;
+    let seg = map[0];
+    for (const s of map) { if (s.sec <= t) seg = s; else break; }
+    groove.bpm = 60 / seg.spb;
+    return seg.beat + (t - seg.sec) / seg.spb;
+  }
+  return now * groove.bpm / 60;
+}
+function grooveHit(vel) { groove.energy = Math.min(1.5, groove.energy + 0.02 * vel); }
+// how likely each dance style is at a given energy (0 = silence, ~0.6 = a busy song)
+const STYLES = {
+  still: e => e < 0.06 ? 4 : 0,
+  sway: e => e < 0.3 ? 2.5 : 0.5,
+  nod: e => e > 0.12 ? 2 : 0.3,
+  bang: e => e > 0.55 ? 2.2 : 0,
+  shimmy: e => e > 0.3 ? 1 : 0.15,
+  weird: e => e > 0.1 ? 0.45 : 0,
+};
+function updateGroove(now, dt) {
+  groove.energy *= Math.exp(-dt * 0.35);
+  const beats = beatNow(now), bar = Math.floor(beats / 4);
+  if (bar !== groove.bar) {
+    // every other bar (every bar when it's loud) the style is re-picked from the energy
+    if (groove.bar < 0 || bar % 2 === 0 || groove.energy > 0.7) {
+      const e = groove.energy, total = Object.values(STYLES).reduce((s, f) => s + f(e), 0);
+      let pick = Math.random() * total;
+      for (const [name, f] of Object.entries(STYLES)) { pick -= f(e); if (pick <= 0) { groove.style = name; break; } }
+    }
+    groove.bar = bar;
+  }
+  // styles blend over about a second so a change eases in
+  const k = 1 - Math.exp(-dt * 1.5);
+  for (const name in groove.w) groove.w[name] += ((name === groove.style ? 1 : 0) - groove.w[name]) * k;
+  groove.beats = beats;
+}
+const grooveAmt = () => FX.groove ? LEVELS.groove : 0;
+// a bump on every beat that dies away before the next one
+const beatPulse = (b, sharp = 6) => Math.exp(-(((b % 1) + 1) % 1) * sharp);
+// a random spread around 1, wider with more groove
+const vary = (spread = 0.3) => 1 + (Math.random() - 0.5) * spread * grooveAmt();
+
+// Pipe Rig dance: every station bobs on the beat (busy ones more), tall ones sway side to side, in the
+// sway and weird styles a wave travels around the ring, and the launcher tower breathes with the energy.
+// The moves are a few centimeters, small enough that balls still land on their targets.
+const tiltQ = new THREE.Quaternion(), FWD = V(0, 0, 1);
+function danceStations() {
+  const g = grooveAmt(), B = groove.beats, w = groove.w, e = Math.min(1, groove.energy * 1.6);
+  const waveMix = w.sway * 0.5 + w.weird;
+  for (const st of stations) {
+    const busy = Math.min(1, st.heat * 0.5), ph = st.angle / (2 * Math.PI) * waveMix;
+    st.group.position.y = st.baseY + g * (0.035 * (0.3 + busy + e * 0.5) * beatPulse(B + ph, 6) * (1 - w.still));
+    const sway = TALL.has(st.spec.kind) ? g * (0.012 * (0.4 + busy) * Math.sin(Math.PI * (B + ph * 2)) + w.weird * 0.01 * Math.sin(Math.PI * 2 * B + st.angle)) : 0;
+    st.group.quaternion.copy(st.baseQ).multiply(tiltQ.setFromAxisAngle(FWD, sway));
+  }
+  if (tower) {
+    const s = 1 + g * 0.02 * beatPulse(B, 5) * (0.3 + e);
+    tower.column.scale.set(s, 1, s); tower.dome.scale.setScalar(s);
+    core.intensity = 0.6 * LEVELS.light * (1 + g * 0.5 * e * beatPulse(B, 4));
+  }
+}
 
 // ---------- machines ----------
 // A machine is one rig the song can play on. All of them share the MIDI engine; each decides
@@ -1471,7 +1551,7 @@ function playVoice(fn, hitAbs, vel) {
 
 const pipeMachine = {
   id: 'pipe', label: 'Pipe Rig', blurb: 'Each note fires a ball early enough to land exactly on the beat. Drag to orbit, scroll to zoom.',
-  lead: () => Math.max(maxTau, selfLead) + 0.15,
+  lead: () => Math.max(maxTau * 1.15, selfLead) + 0.15,
   enter() { pipeWorld.visible = true; scene.background = PIPE_BG; scene.fog = PIPE_FOG; scene.environment = null; setBloom(0.6, 0.4, 0.95); },
   exit() { clearLayout(); pipeWorld.visible = false; },
   load(entry) {
@@ -1488,11 +1568,11 @@ const pipeMachine = {
     if (!st) return false;
     // delayed: the hit lands after the full flight or mechanism, so everything plays out in full
     // instant: it lands almost now, so balls and marbles appear already on their way
-    playOnStation(st, note, nowSec() + (mode === 'delay' ? Math.max(maxTau, st.lead || 0) + 0.05 : 0.07), vel / 127, 0.35);
+    playOnStation(st, note, nowSec() + (mode === 'delay' ? Math.max(maxTau * 1.15, st.lead || 0) + 0.05 : 0.07), vel / 127, 0.35);
     return true;
   },
   update(now, dt) {
-    updateBalls(now, dt); updateInstruments(now); updateTubes(now);
+    updateBalls(now, dt); updateInstruments(now); updateTubes(now); danceStations();
     for (const st of stations) { st.heat *= Math.exp(-dt * 0.8); if (st.tick) st.tick(now, dt); }
   },
   // auto camera: a wide view of the ring, close on the busiest instrument, low on the tower, or overhead
@@ -1877,6 +1957,7 @@ const limbs = { L: { side: -1, strokes: [] }, R: { side: 1, strokes: [] }, RF: {
 let pieceHits = [], dollHits = 0, hatOpenUntil = -1, kickPulse = { t0: -10, amp: 0 };
 function resetLimbs() { for (const k in limbs) limbs[k].strokes = []; pieceHits = []; }
 const busyAt = (limb, t, piece) => limb.strokes.some(s => Math.abs(s.t - t) < 0.07 && s.piece !== piece);
+const runs = {};
 function drumHit(piece, t, vel) {
   const voice = piece;
   const vis = piece === 'hatOpen' || piece === 'hatPedal' ? 'hat' : piece;
@@ -1893,7 +1974,13 @@ function drumHit(piece, t, vel) {
   if (recent && !busyAt(limbs[other], t, vis)) h = other;
   if (busyAt(limbs[h], t, vis)) h = h === pref ? other : pref;
   if (busyAt(limbs[h], t, vis)) return;                     // three hands' worth at once: heard, not seen
-  limbs[h].strokes.push({ t, piece: vis, vel });
+  // no two strokes alike: each gets its own height, angle and spot on the head, and a run of repeats on
+  // one drum rises and falls the way a drummer accents it instead of hitting the same way every time
+  const run = runs[vis] && t - runs[vis].t < 0.45 ? runs[vis].n + 1 : 0;
+  runs[vis] = { t, n: run };
+  const g = grooveAmt(), shape = [1, 0.8, 0.9, 0.75][run % 4] * (run % 8 >= 4 ? 0.94 : 1);
+  const v = { hgt: (1 + (shape - 1) * Math.min(1, g)) * vary(0.25), ang: (Math.random() - 0.5) * 0.25 * g, off: (Math.random() - 0.5) * 0.05 * g };
+  limbs[h].strokes.push({ t, piece: vis, vel, v });
   limbs[h].strokes.sort((a, b) => a.t - b.t);
   ph.hand = h;
 }
@@ -1913,8 +2000,8 @@ function liftCurve(prev, next, now, maxPrep, phase = 0) {
   const gap = prev && next ? next.t - prev.t : 1;
   const prep = clamp(gap * 0.55, 0.05, maxPrep);
   const hover = 0.42 + 0.04 * Math.sin(now * 2.3 + phase);
-  const ampN = next && until < 1.2 ? (0.4 + 0.6 * next.vel) * space(gap) : hover;
-  const ampP = prev ? (0.4 + 0.6 * prev.vel) * space(gap) : hover;
+  const ampN = next && until < 1.2 ? (0.4 + 0.6 * next.vel) * space(gap) * (next.v ? next.v.hgt : 1) : hover;
+  const ampP = prev ? (0.4 + 0.6 * prev.vel) * space(gap) * (prev.v ? prev.v.hgt : 1) : hover;
   const wind = until < prep ? ampN * Math.sin((until / prep) * Math.PI / 2) : ampN;
   const reb = ampP * (1 - Math.exp(-since * 13) * (1 + since * 13));
   return Math.min(wind, reb, 1);
@@ -1936,6 +2023,14 @@ function poseArm(side, now) {
   const lift = liftCurve(prev, next, now, 0.22, side === 'L' ? 0 : 2.1);
   wristT.lerpVectors(A.wrist, B.wrist, u);
   dirT.lerpVectors(A.dir, B.dir, u).normalize();
+  // this stroke's own angle and spot, blended from the last stroke's so the hand never jumps
+  const pv = prev && prev.v, nv = next && next.v;
+  if (pv || nv) {
+    const f = pv && nv ? smooth(clamp((now - prev.t) / Math.max(0.01, next.t - prev.t), 0, 1)) : nv ? 1 : 0;
+    const off = (pv ? pv.off : 0) * (1 - f) + (nv ? nv.off : 0) * f, ang = (pv ? pv.ang : 0) * (1 - f) + (nv ? nv.ang : 0) * f;
+    wristT.addScaledVector(tmpB.crossVectors(UP, dirT).normalize(), off);
+    dirT.applyAxisAngle(UP, ang * 0.5);
+  }
   // moving between drums the hand arcs up and over instead of sliding straight across
   const hop = A === B ? 0 : 4 * u * (1 - u) * Math.min(0.08, A.wrist.distanceTo(B.wrist) * 0.25);
   // the wrist does most of the stroke; the forearm joins in more on louder notes
@@ -2003,7 +2098,7 @@ function poseLeg(side, pedal, boardAngle, now, lift = 0) {
 // damped springs for secondary motion (semi-implicit Euler; z < 1 gives a little natural overshoot)
 const spr = (k, z) => ({ x: 0, v: 0, k, c: 2 * Math.sqrt(k) * z });
 function stepSpr(s, target, dt) { s.v += (s.k * (target - s.x) - s.c * s.v) * dt; s.x += s.v * dt; return s.x; }
-const body = { nod: spr(140, 0.45), lean: spr(80, 0.6), roll: spr(60, 0.5), twist: spr(30, 1) };
+const body = { nod: spr(140, 0.45), lean: spr(80, 0.6), roll: spr(60, 0.5), twist: spr(30, 1), hair: spr(30, 0.35) };
 // [head nod, torso drive] impulse per piece
 const BODY_KICK = { kick: [1, 0.45], snare: [0.6, 0.2], crash: [0.5, 0.3], floor: [0.35, 0.15], tomMid: [0.3, 0.12], tomHi: [0.3, 0.12], ride: [0.15, 0.04], hat: [0.1, 0] };
 
@@ -2024,6 +2119,7 @@ function updateDoll(now, dt) {
     if (h.piece === 'kick') kickPulse = { t0: h.t, amp: h.vel };
     if (h.piece === 'crash') key.intensity = 1.8 * LEVELS.light;
     // each hit nudges the body's springs: kicks drive the head and torso, hand strokes rock toward their side
+    grooveHit(h.vel);
     const [n, l] = BODY_KICK[h.piece] || [0.1, 0];
     body.nod.v += n * h.vel; body.lean.v += l * h.vel;
     if (h.hand) body.roll.v += (h.hand === 'L' ? 1 : -1) * 0.3 * h.vel;
@@ -2036,13 +2132,23 @@ function updateDoll(now, dt) {
   const sdt = Math.min(dt, 0.033);
   stepSpr(body.nod, 0, sdt); stepSpr(body.lean, 0, sdt); stepSpr(body.roll, 0, sdt);
   stepSpr(body.twist, clamp((arms.L.wrist.x + arms.R.wrist.x) * 0.3, -0.2, 0.2), sdt);
-  const lean = 0.12 + body.lean.x + Math.sin(now * 1.6) * 0.012, nod = body.nod.x;
-  chest.rotation.set(lean, body.twist.x, body.roll.x);
+  // the dance layered on the hit springs: chill sway, nod, headbang, shoulder shimmy, or off-beat weirdness
+  const g = grooveAmt(), w = groove.w, B = groove.beats, e = Math.min(1, groove.energy * 1.6);
+  const half = Math.sin(Math.PI * B), quarter = Math.sin(Math.PI * B * 0.5), quick = Math.sin(Math.PI * 4 * B);
+  const gNod = g * (w.nod * 0.07 * beatPulse(B, 5) + w.bang * 0.2 * beatPulse(B, 9) + w.sway * 0.025 * beatPulse(B, 4) + w.weird * 0.05 * Math.sin(Math.PI * 2 * B + 1));
+  const gRoll = g * (w.sway * 0.06 * half + w.shimmy * 0.035 * quick + w.weird * 0.05 * quarter + w.nod * 0.015 * half);
+  const gTwist = g * (w.sway * 0.05 * quarter + w.shimmy * 0.06 * Math.sin(Math.PI * 4 * B + 0.7));
+  const gTilt = g * (w.weird * 0.22 * Math.sin(Math.PI * B + 0.5) + w.sway * 0.06 * half + w.nod * 0.03 * quarter);
+  const gLean = g * (0.025 * e * beatPulse(B, 5) + w.bang * 0.04 * beatPulse(B, 7));
+  const lean = 0.12 + body.lean.x + gLean + Math.sin(now * 1.6) * 0.012, nod = body.nod.x + gNod;
+  const twist = body.twist.x + gTwist, roll = body.roll.x + gRoll;
+  chest.rotation.set(lean, twist, roll);
   chest.updateMatrix();
-  head.rotation.set(-0.02 + nod, -body.twist.x * 0.5, -body.roll.x * 0.6 + Math.sin(now * 1.3) * 0.02);
-  hairBack.rotation.x = 0.08 + nod * 0.8 + Math.sin(now * 2.1) * 0.015;
-  hairBack.rotation.z = -body.twist.x * 0.3 - body.roll.x * 0.5;
-  if (custom) poseCustomBody(lean, body.twist.x, body.roll.x, -0.06 + nod, -body.twist.x * 0.5);
+  head.rotation.set(-0.02 + nod, -twist * 0.5, -roll * 0.6 + gTilt + Math.sin(now * 1.3) * 0.02);
+  stepSpr(body.hair, nod, sdt);   // the hair lags behind the head
+  hairBack.rotation.x = 0.08 + body.hair.x * 1.2 + Math.sin(now * 2.1) * 0.015;
+  hairBack.rotation.z = -twist * 0.3 - roll * 0.5 - gTilt * 0.4;
+  if (custom) poseCustomBody(lean, twist, roll, -0.06 + nod, -twist * 0.5, gTilt);
 
   poseArm('L', now);
   poseArm('R', now);
@@ -2254,7 +2360,7 @@ function installCustom(model, label) {
 }
 
 // start of each custom frame: back to the bind pose, then lean, twist and rock the spine, and nod the head
-function poseCustomBody(lean, twist, roll, headPitch, headYaw) {
+function poseCustomBody(lean, twist, roll, headPitch, headYaw, headRoll = 0) {
   for (const [b, q] of custom.rest) b.quaternion.copy(q);
   custom.wrap.updateMatrixWorld(true);
   const X = V(1, 0, 0), Z = V(0, 0, 1);
@@ -2263,6 +2369,7 @@ function poseCustomBody(lean, twist, roll, headPitch, headYaw) {
   rotateWorld(custom.R.spine, Z, roll);
   rotateWorld(custom.R.head, X, headPitch);
   rotateWorld(custom.R.head, UP, headYaw);
+  rotateWorld(custom.R.head, Z, headRoll);
 }
 
 // ---------- reading model files: .glb, .gltf with its files, or a .zip of either ----------
@@ -2512,9 +2619,9 @@ let cur = -1;
 
 function entryFromFile(name, buf) {
   try {
-    const { notes, parts } = parseMidi(buf);
+    const { notes, parts, tempo } = parseMidi(buf);
     if (!notes.length) throw new Error('No notes found.');
-    return makeEntry(name, notes, parts);
+    return Object.assign(makeEntry(name, notes, parts), { tempo });
   } catch (err) { return { name, error: err.message }; }
 }
 function addSongs(items, autoplay) {
@@ -2744,7 +2851,7 @@ function applyLevels() {
   setBloom(bloomBase.strength, bloomBase.radius, bloomBase.threshold);
   applyEnvIntensity();
 }
-for (const [id, k, label] of [['#lightAmt', 'light', 'Stage light'], ['#glowAmt', 'glow', 'Glow strength']]) {
+for (const [id, k, label] of [['#lightAmt', 'light', 'Stage light'], ['#glowAmt', 'glow', 'Glow strength'], ['#grooveAmt', 'groove', 'Groove amount']]) {
   const el = $(id);
   el.value = LEVELS[k];
   el.oninput = () => {
@@ -2825,6 +2932,7 @@ let last = nowSec(), hudT = 0;
 function frame() {
   const now = nowSec(), dt = Math.min(0.05, now - last); last = now;
   pumpSong(now);
+  updateGroove(now, dt);
   machine.update(now, dt);
   updateHitLights(now);
   if (!directCamera(now, dt) && !reduceMotion && !drag && now - lastTouch > 5) orbit.theta += dt * 0.03;
