@@ -11,6 +11,7 @@ MIDI-driven 3D music machines in the browser. Every note is scheduled ahead of t
   - running their own mechanism: **marble run** (marbles roll a rail and drop onto xylophone bars), **bellows organ** (valves open, pipes glow and puff smoke rings while the bellows breathe) and **laser lyre** (emitters charge, beams snap on and tremble while held)
 - **Doll Drummer** — a jointed fashion doll on a pink sparkle kit. Sticks wind up ahead of each note, hands and feet are posed with two-bone IK, and the body moves on springs. You can load your own rigged humanoid (`.glb`, `.gltf` or `.zip`) and it's driven the same way.
 - **Squish** — translucent gummy blobs, one per part, on a calm stage. For each note the blob spits a small round piece of itself off the top of its head: the top puckers, the body hops, and the piece is thrown high into the air (about 1 to 2.5 above its head, louder notes higher) on an arc timed like Pipe Rig's balls, so it falls back onto its spot on the head exactly on the beat (low notes on the left, high on the right). The landing is the note: it splats, dents the head and is absorbed straight away; a held note keeps the dent pressed for its length. The blobs are spring-mass soft bodies: they dent, bulge, wobble and settle on their own, and loud hits send rings through the backdrop. The sound comes from the shape: the voice's vowel opens and closes with the blob's squash and its pitch bends with the wobble. Drag a blob to pull it like taffy and it sings, higher the further it stretches. Every blob has glossy eyes set into the jelly: they watch their own pieces fly up and come down, glance at you and at each other, blink, squint on hard hits, go wide when grabbed and droop blissfully during long notes. Every hit flings jelly droplets on real arcs; they stretch as they fly, tick as they land and spread into little splats, or merge back into a blob they fall on. Some pieces leave the head trailing a sticky strand that stretches thin and snaps. Thin edges of the jelly stay bright while thick middles deepen, with a soft sheen at grazing angles.
+- **Smokes** — cigarette packs on a dark tabletop, one per part (drums sit out). Each of a pack's 20 cigarettes is a note, pitch running left to right: a note lifts its cigarette about an inch out of the pack on a spring, the filter glows, smoke pours out and curls upward while the note holds, and it sinks back when the note ends. A breathy wind voice with a chiff and blooming vibrato, made for slow wind melodies.
 
 ## Run it
 
@@ -20,7 +21,7 @@ You can also open the page any other way and drag `.mid` files onto it. Sampled 
 
 ## Controls
 
-- **Machine** — switch between Pipe Rig, Doll Drummer and Squish.
+- **Machine** — switch between Pipe Rig, Doll Drummer, Squish and Smokes.
 - **Songs** — load or drop MIDI files, step with `[` / `]`, auto-advance.
 - **Instruments** (Pipe Rig) — turn instrument types on or off for every song.
 - **Effects** — each switches on or off and is remembered:
@@ -56,6 +57,7 @@ Pipe Rig launches each ball at `T − τ` with `v₀ = (P − L)/τ − ½gτ`, 
 - [three.js](https://threejs.org) r170 (MIT), plus its GLTFLoader, RGBELoader and post-processing add-ons
 - [JSZip](https://stuk.github.io/jszip/) (MIT)
 - HDRI environments in `assets/hdri/`: [Poly Haven](https://polyhaven.com) (CC0)
+- Cigarette pack model in `assets/models/cigarette_pack/`: [Cigarette Pack](https://polyhaven.com/a/cigarette_pack) by Ulrich Büch, Poly Haven (CC0)
 - Instrument samples: FluidR3 GM by Frank Wen, rendered by [gleitz/midi-js-soundfonts](https://github.com/gleitz/midi-js-soundfonts), [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/)
 - Fonts: Bricolage Grotesque and IBM Plex Mono via Google Fonts (OFL)
 

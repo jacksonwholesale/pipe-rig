@@ -129,6 +129,7 @@ body.dropping #stage { outline: 3px dashed var(--copper); outline-offset: -12px;
       <button data-m="pipe" aria-pressed="true">Pipe Rig</button>
       <button data-m="doll" aria-pressed="false">Doll Drummer</button>
       <button data-m="squish" aria-pressed="false">Squish</button>
+      <button data-m="smokes" aria-pressed="false">Smokes</button>
     </span>
   </div>
   <div class="row">
@@ -3450,7 +3451,390 @@ function renderSquishParts(entry) {
   $('#partSummary').textContent = `${entry.parts.length} part${entry.parts.length > 1 ? 's' : ''} on ${blobs.length} blob${blobs.length === 1 ? '' : 's'}` + (off ? ` · ${off} off` : '') + ' (click to change)';
 }
 
-const MACHINES = { pipe: pipeMachine, doll: dollMachine, squish: squishMachine };
+
+// ---------- smokes: a cigarette pack where every cigarette is a note ----------
+// The model is Poly Haven's "Cigarette Pack" by Ulrich Büch (CC0). Its 20 cigarettes are one merged mesh, so
+// they're split apart as it loads. A note raises its cigarette about an inch out of the pack on a spring, the
+// filter glows, smoke pours out while the note holds, and the cigarette sinks back when it ends. Pitch runs
+// left to right across the pack; each part gets its own pack.
+const smokeWorld = new THREE.Group();
+smokeWorld.visible = false;
+scene.add(smokeWorld);
+const SMOKE_BG = new THREE.Color(0x120e0c);
+const PACK_SCALE = 10;        // the model is life size (10 cm tall); scaled up so a pack stands about a metre
+const CIG_RISE = 0.0254;      // an inch, in model units (metres)
+const smBackdrop = new THREE.Mesh(new THREE.SphereGeometry(60, 32, 16), new THREE.ShaderMaterial({
+  side: THREE.BackSide, depthWrite: false,
+  vertexShader: `varying vec3 v_dir; void main () { v_dir = normalize(position); gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+  fragmentShader: `varying vec3 v_dir; void main () {
+      vec3 d = normalize(v_dir);
+      vec3 c = mix(vec3(0.10, 0.075, 0.06), vec3(0.22, 0.16, 0.12), smoothstep(-0.1, 0.5, d.y) * smoothstep(1.0, 0.2, abs(d.x)));
+      gl_FragColor = linearToOutputTexel(vec4(pow(c, vec3(2.2)), 1.0));
+    }`,
+}));
+smokeWorld.add(smBackdrop);
+const smTable = new THREE.Mesh(new THREE.CircleGeometry(40, 64), new THREE.MeshStandardMaterial({ color: 0x1a110c, roughness: 0.45, metalness: 0 }));
+smTable.rotation.x = -Math.PI / 2; smTable.receiveShadow = true;
+smokeWorld.add(smTable);
+const smHemi = new THREE.HemisphereLight(0xffe2c4, 0x2a1810, 0.35 * LI);
+const smKey = new THREE.SpotLight(0xffd6a8, 1.6 * LI, 0, 0.45, 0.8, 0);
+smKey.position.set(-2.2, 3.6, 2.6); smKey.target.position.set(0, 0.6, 0);
+smKey.castShadow = true; smKey.shadow.mapSize.set(2048, 2048); smKey.shadow.radius = 5; smKey.shadow.bias = -0.0004;
+// a cool light from behind catches the smoke and rims the packs
+const smRim = new THREE.DirectionalLight(0xb8ccff, 1.2 * LI);
+smRim.position.set(1.5, 2.5, -4);
+smokeWorld.add(smHemi, smKey, smKey.target, smRim);
+
+// ---------- the model, split into a pack and twenty cigarettes ----------
+let packModel = null, packLoading = null;
+function loadPackModel() {
+  if (packModel) return Promise.resolve(packModel);
+  if (packLoading) return packLoading;
+  const base = 'assets/models/cigarette_pack/';
+  const parse = text => new Promise((res, rej) => new THREE.GLTFLoader().parse(text, base, res, e => rej(new Error(e && e.message ? e.message : 'the model could not be read'))));
+  return packLoading = (async () => {
+    let gltf;
+    try {
+      const r = await fetch(base + 'cigarette_pack.gltf');
+      if (!r.ok) throw new Error(String(r.status));
+      gltf = await parse(await r.text());
+    } catch {
+      // hosts that won't serve .gltf and .bin files get a JSON copy with the geometry embedded
+      const r = await fetch(base + 'cigarette_pack.gltf.json');
+      if (!r.ok) throw new Error('the cigarette pack model did not load');
+      gltf = await parse(await r.text());
+    }
+    return packModel = splitPack(gltf.scene);
+  })().catch(err => { packLoading = null; throw err; });
+}
+function splitPack(root) {
+  const get = name => { const o = root.getObjectByName(name); if (!o || !o.isMesh) throw new Error('the model is missing ' + name); return o; };
+  const body = get('cigarette_pack_main'), foil = get('cigarette_pack_foil'), many = get('cigarette_pack_cigarettes'), one = get('cigarette_pack_cigarette');
+  // pieces are triangles joined by shared corners (or corners at the same spot); pieces standing at the same
+  // spot (a tube and its filter cap) are one cigarette
+  const g = many.geometry, pos = g.attributes.position, tri = g.index.array, n = pos.count;
+  const parent = Int32Array.from({ length: n }, (_, i) => i);
+  const find = x => { while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; };
+  const join = (a, b) => { a = find(a); b = find(b); if (a !== b) parent[b] = a; };
+  for (let i = 0; i < tri.length; i += 3) { join(tri[i], tri[i + 1]); join(tri[i], tri[i + 2]); }
+  const seen = new Map();
+  for (let i = 0; i < n; i++) {
+    const k = pos.getX(i).toFixed(5) + ',' + pos.getY(i).toFixed(5) + ',' + pos.getZ(i).toFixed(5);
+    if (seen.has(k)) join(seen.get(k), i); else seen.set(k, i);
+  }
+  const box = new Map();
+  for (let i = 0; i < n; i++) {
+    const r = find(i), b = box.get(r) || { x0: 9, x1: -9, z0: 9, z1: -9 };
+    b.x0 = Math.min(b.x0, pos.getX(i)); b.x1 = Math.max(b.x1, pos.getX(i)); b.z0 = Math.min(b.z0, pos.getZ(i)); b.z1 = Math.max(b.z1, pos.getZ(i));
+    box.set(r, b);
+  }
+  const cigs = new Map();
+  for (let i = 0; i < tri.length; i += 3) {
+    const b = box.get(find(tri[i])), x = (b.x0 + b.x1) / 2, z = (b.z0 + b.z1) / 2, key = Math.round(x * 2000) + ',' + Math.round(z * 2000);
+    if (!cigs.has(key)) cigs.set(key, { x, z, tris: [] });
+    cigs.get(key).tris.push(tri[i], tri[i + 1], tri[i + 2]);
+  }
+  const list = [...cigs.values()].map(c => {
+    const geo = new THREE.BufferGeometry();
+    for (const [name, attr] of Object.entries(g.attributes)) geo.setAttribute(name, attr);
+    geo.setIndex(c.tris);
+    return { geo, x: c.x, z: c.z, restY: 0 };
+  });
+  // the one already pulled out of the pack: pushed back down so every cigarette starts flush
+  one.geometry.computeBoundingBox();
+  const ob = one.geometry.boundingBox;
+  list.push({ geo: one.geometry, x: (ob.min.x + ob.max.x) / 2, z: (ob.min.z + ob.max.z) / 2, restY: -ob.min.y });
+  // left to right, back to front, so pitch sweeps across the pack like a keyboard
+  list.sort((a, b) => a.x - b.x || a.z - b.z);
+  return { body, foil, material: many.material, cigs: list, top: g.boundingBox ? g.boundingBox.max.y : 0.078 };
+}
+
+// ---------- smoke: soft puffs that rise, curl, spread and thin out ----------
+const smokeTex = (() => {
+  const c = document.createElement('canvas'); c.width = c.height = 128;
+  const x = c.getContext('2d');
+  for (let i = 0; i < 26; i++) {
+    const px = 64 + (Math.random() - 0.5) * 50, py = 64 + (Math.random() - 0.5) * 50, r = 14 + Math.random() * 30;
+    const gr = x.createRadialGradient(px, py, 0, px, py, r);
+    gr.addColorStop(0, 'rgba(255,255,255,0.22)'); gr.addColorStop(1, 'rgba(255,255,255,0)');
+    x.fillStyle = gr; x.fillRect(0, 0, 128, 128);
+  }
+  // keep it round overall so no square edges show
+  x.globalCompositeOperation = 'destination-in';
+  const m = x.createRadialGradient(64, 64, 20, 64, 64, 64);
+  m.addColorStop(0, 'rgba(0,0,0,1)'); m.addColorStop(1, 'rgba(0,0,0,0)');
+  x.fillStyle = m; x.fillRect(0, 0, 128, 128);
+  return new THREE.CanvasTexture(c);
+})();
+const MAX_SMOKE = 1400;
+const smoke = (() => {
+  const geo = new THREE.BufferGeometry();
+  const P = new Float32Array(MAX_SMOKE * 3), S = new Float32Array(MAX_SMOKE), A = new Float32Array(MAX_SMOKE), R = new Float32Array(MAX_SMOKE);
+  geo.setAttribute('position', new THREE.BufferAttribute(P, 3).setUsage(THREE.DynamicDrawUsage));
+  geo.setAttribute('a_size', new THREE.BufferAttribute(S, 1).setUsage(THREE.DynamicDrawUsage));
+  geo.setAttribute('a_alpha', new THREE.BufferAttribute(A, 1).setUsage(THREE.DynamicDrawUsage));
+  geo.setAttribute('a_rot', new THREE.BufferAttribute(R, 1).setUsage(THREE.DynamicDrawUsage));
+  const mat = new THREE.ShaderMaterial({
+    transparent: true, depthWrite: false,
+    uniforms: { u_tex: { value: smokeTex }, u_scale: { value: 800 } },
+    vertexShader: `attribute float a_size; attribute float a_alpha; attribute float a_rot; uniform float u_scale;
+      varying float v_alpha; varying float v_rot;
+      void main () {
+        vec4 mv = modelViewMatrix * vec4(position, 1.0);
+        gl_PointSize = a_size * u_scale / -mv.z;
+        v_alpha = a_alpha; v_rot = a_rot;
+        gl_Position = projectionMatrix * mv;
+      }`,
+    fragmentShader: `uniform sampler2D u_tex; varying float v_alpha; varying float v_rot;
+      void main () {
+        vec2 p = gl_PointCoord - 0.5;
+        p = mat2(cos(v_rot), -sin(v_rot), sin(v_rot), cos(v_rot)) * p + 0.5;
+        float a = texture2D(u_tex, p).a * v_alpha;
+        gl_FragColor = vec4(vec3(0.62, 0.6, 0.58) * a, a);
+      }`,
+    blending: THREE.CustomBlending, blendSrc: THREE.OneFactor, blendDst: THREE.OneMinusSrcAlphaFactor,
+  });
+  const pts = new THREE.Points(geo, mat);
+  pts.frustumCulled = false; pts.renderOrder = 2;
+  smokeWorld.add(pts);
+  return { pts, geo, P, S, A, R, list: [] };
+})();
+function puff(at, vel, n, kick = 1) {
+  for (let k = 0; k < n; k++) {
+    if (smoke.list.length >= MAX_SMOKE) smoke.list.shift();
+    smoke.list.push({
+      p: at.clone().add(V((Math.random() - 0.5) * 0.02, 0, (Math.random() - 0.5) * 0.02)),
+      v: V((Math.random() - 0.5) * 0.06 * kick, (0.18 + Math.random() * 0.2) * (0.6 + 0.6 * vel) * kick, (Math.random() - 0.5) * 0.06 * kick),
+      age: 0, life: 2.4 + Math.random() * 1.6, size: 0.03 + Math.random() * 0.03, grow: 0.16 + Math.random() * 0.16,
+      rot: Math.random() * 6.28, spin: (Math.random() - 0.5) * 0.8, seed: Math.random() * 100, dens: 0.16 + 0.22 * vel,
+    });
+  }
+}
+function updateSmoke(now, dt) {
+  const s = smoke;
+  s.list = s.list.filter(q => (q.age += dt) < q.life);
+  s.list.forEach((q, i) => {
+    // buoyant and lazily curling: it rises, wanders sideways and slows as it spreads
+    const t = now * 0.7 + q.seed;
+    q.v.x += (Math.sin(q.p.y * 2.3 + t) * 0.09 + Math.sin(t * 0.37) * 0.03) * dt;
+    q.v.z += Math.cos(q.p.y * 1.9 + t * 1.3) * 0.07 * dt;
+    q.v.y += 0.03 * dt;
+    q.v.multiplyScalar(Math.exp(-dt * 0.35));
+    q.p.addScaledVector(q.v, dt);
+    q.rot += q.spin * dt;
+    const u = q.age / q.life;
+    s.P[i * 3] = q.p.x; s.P[i * 3 + 1] = q.p.y; s.P[i * 3 + 2] = q.p.z;
+    s.S[i] = q.size + q.grow * Math.sqrt(q.age);
+    s.A[i] = q.dens * Math.min(1, q.age * 6) * Math.pow(1 - u, 1.6);
+    s.R[i] = q.rot;
+  });
+  s.geo.setDrawRange(0, s.list.length);
+  for (const k of ['position', 'a_size', 'a_alpha', 'a_rot']) s.geo.attributes[k].needsUpdate = true;
+  s.pts.material.uniforms.u_scale.value = renderer.domElement.height / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2));
+}
+
+// ---------- packs ----------
+const packs = [];
+let smokeHits = 0, smokeNotes = [];
+const emberGeo = new THREE.CircleGeometry(0.0038, 20);
+function buildPacks(entry) {
+  for (const p of packs) smokeWorld.remove(p.group);
+  packs.length = 0;
+  if (!packModel) return;
+  const ids = [...new Set(Object.values(entry.smokeMap).filter(v => v !== 'off'))];
+  if (!ids.length) ids.push('p0');
+  const n = ids.length;
+  ids.forEach((id, k) => {
+    const parts = entry.parts.filter(pt => entry.smokeMap[pt.key] === id);
+    // the pitches this pack plays, spread across its twenty cigarettes
+    const pitches = [...new Set(entry.notes.filter(e => entry.smokeMap[e.part] === id).map(e => e.note))].sort((a, b) => a - b);
+    const group = new THREE.Group();
+    group.scale.setScalar(PACK_SCALE);
+    const x = (k - (n - 1) / 2) * 0.82;
+    group.position.set(x, 0, -Math.abs(x) * 0.2);
+    group.rotation.y = -x * 0.18;
+    for (const src of [packModel.body, packModel.foil]) { const m = src.clone(); m.castShadow = m.receiveShadow = true; group.add(m); }
+    const cigs = packModel.cigs.map(c => {
+      const mesh = new THREE.Mesh(c.geo, packModel.material);
+      mesh.castShadow = mesh.receiveShadow = true;
+      mesh.position.y = c.restY;
+      // a warm glow over the filter while it plays
+      const ember = new THREE.Mesh(emberGeo, new THREE.MeshBasicMaterial({ color: 0xff7a2a, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false }));
+      ember.rotation.x = -Math.PI / 2; ember.position.set(c.x, packModel.top - c.restY + 0.0004, c.z);
+      mesh.add(ember);
+      group.add(mesh);
+      return { mesh, ember, x: c.x, z: c.z, restY: c.restY, y: 0, vy: 0, tilt: 0, vtilt: 0, notes: [], glow: 0 };
+    });
+    smokeWorld.add(group);
+    const lo = pitches.length ? pitches[0] : 48, hi = pitches.length ? pitches[pitches.length - 1] : 84;
+    packs.push({ id, group, cigs, pitches, lo, hi, heat: 0, name: parts.map(pt => pt.name).join(' + ') });
+  });
+  smokeMachine.wide = Math.max(2.8, (n - 1) * 0.82 + 2.4);
+}
+// which cigarette plays a pitch: the song's pitches for this pack spread evenly across the twenty
+function cigFor(pack, note) {
+  const N = pack.cigs.length, P = pack.pitches;
+  if (P.length && P.length <= N) {
+    let i = P.indexOf(note);
+    if (i < 0) i = P.reduce((m, p, j) => (Math.abs(p - note) < Math.abs(P[m] - note) ? j : m), 0);
+    const off = Math.floor((N - P.length) / 2);
+    return pack.cigs[P.length === N ? i : off + i];
+  }
+  const u = pack.hi > pack.lo ? (note - pack.lo) / (pack.hi - pack.lo) : 0.5;
+  return pack.cigs[Math.round(clamp(u, 0, 1) * (N - 1))];
+}
+function defaultSmokeMap(entry) {
+  entry.smokeMap = {};
+  const parts = entry.parts.filter(pt => pt.ch !== 9 && guessKind(pt) !== 'off').sort((a, b) => b.count - a.count);
+  const own = [];
+  for (const pt of parts) {
+    const mid = (pt.lo + pt.hi) / 2;
+    if (own.length < 4) { own.push(mid); entry.smokeMap[pt.key] = 'p' + (own.length - 1); continue; }
+    let best = 0;
+    own.forEach((m, k) => { if (Math.abs(m - mid) < Math.abs(own[best] - mid)) best = k; });
+    entry.smokeMap[pt.key] = 'p' + best;
+  }
+  for (const pt of entry.parts) if (!entry.smokeMap[pt.key]) entry.smokeMap[pt.key] = 'off';
+}
+
+// ---------- the voice: a breathy wind tone with a chiff at the start and vibrato that blooms ----------
+function smokeVoice(midi, t, vel, d, pan) {
+  const f = mtof(midi), len = d != null ? Math.max(0.18, d) : 0.5, peak = 0.15 * (0.3 + 0.7 * vel);
+  const g = actx.createGain(), end = t + len;
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(peak, t + 0.09);
+  g.gain.setTargetAtTime(peak * 0.85, t + 0.12, 0.3);
+  g.gain.setValueAtTime(peak * 0.85, end);
+  g.gain.exponentialRampToValueAtTime(0.0001, end + 0.32);
+  if (actx.createStereoPanner) { const p = actx.createStereoPanner(); p.pan.value = pan; g.connect(p).connect(master); } else g.connect(master);
+  const lp = filt('lowpass', Math.min(9000, f * 3.5), 0.7);
+  lp.connect(g);
+  const o = osc('triangle', f, t, len + 0.4, lp), h2 = actx.createGain();
+  h2.gain.value = 0.18; h2.connect(lp); osc('sine', f * 2, t, len + 0.4, h2);
+  const lfo = actx.createOscillator(), dep = actx.createGain();
+  lfo.frequency.value = 4.6 + Math.random() * 0.8;
+  dep.gain.setValueAtTime(0, t); dep.gain.linearRampToValueAtTime(f * 0.007, t + Math.min(0.6, len));
+  lfo.connect(dep).connect(o.frequency); lfo.start(t); lfo.stop(end + 0.4);
+  // breath: looping noise around the pitch, louder on the attack
+  const br = actx.createBufferSource(), bp = filt('bandpass', Math.min(9000, f * 2), 1.6), bg = actx.createGain();
+  br.buffer = noiseBuf; br.loop = true;
+  bg.gain.setValueAtTime(0.0001, t);
+  bg.gain.exponentialRampToValueAtTime(0.5 * vel + 0.05, t + 0.03);
+  bg.gain.setTargetAtTime(0.12 + 0.1 * vel, t + 0.05, 0.08);
+  bg.gain.setValueAtTime(0.12 + 0.1 * vel, end);
+  bg.gain.exponentialRampToValueAtTime(0.0001, end + 0.3);
+  br.connect(bp).connect(bg).connect(g); br.start(t, Math.random() * 0.5); br.stop(end + 0.35);
+}
+
+// ---------- each frame: notes find their cigarettes, cigarettes rise on springs, glow and smoke ----------
+const SMOKE_LEAD = 0.3;
+const smTmp = V(0, 0, 0);
+function updatePacks(now, dt) {
+  // notes wait here until their pack exists (the model loads after the song is set up)
+  smokeNotes = smokeNotes.filter(e => {
+    const pack = packs.find(p => p.id === e.pack);
+    if (!pack) return now < e.t + 2;
+    cigFor(pack, e.note).notes.push(e);
+    return false;
+  });
+  for (const pack of packs) {
+    pack.heat *= Math.exp(-dt * 0.8);
+    for (const c of pack.cigs) {
+      c.notes = c.notes.filter(e => now < e.end + 0.6);
+      let up = 0, playing = null;
+      for (const e of c.notes) {
+        // up a moment before the note, held while it sounds, back down after
+        const a = clamp((now - (e.t - SMOKE_LEAD)) / SMOKE_LEAD, 0, 1), r = now > e.end ? Math.max(0, 1 - (now - e.end) / 0.3) : 1;
+        up = Math.max(up, Math.min(1 - Math.pow(1 - a, 3), r) * e.h);
+        if (now >= e.t && now < e.end) playing = e;
+        if (now >= e.t && !e.started) {
+          e.started = true; smokeHits++; pack.heat += e.vel; grooveHit(e.vel);
+          c.vy += 0.15 * e.vel; c.vtilt += (Math.random() - 0.5) * 6 * e.vel;
+          smTmp.set(c.x, packModel.top + c.y, c.z); pack.group.localToWorld(smTmp);
+          puff(smTmp, e.vel, Math.round(2 + 4 * e.vel), 1.6);
+          flashAt(smTmp, new THREE.Color(0xff8a3a), e.vel * 0.6, 1.2, 6, 0.6);
+        }
+      }
+      // a spring toward the target height, so it pops up with a little overshoot and settles
+      const target = up * CIG_RISE;
+      c.vy += (260 * (target - c.y) - 16 * c.vy) * dt;
+      c.y += c.vy * dt;
+      c.vtilt += (-180 * c.tilt - 9 * c.vtilt) * dt;
+      c.tilt += c.vtilt * dt;
+      c.mesh.position.y = c.restY + c.y;
+      c.mesh.rotation.z = c.tilt * 0.05;
+      c.glow += ((playing ? 0.55 + 0.45 * playing.vel : 0) - c.glow) * Math.min(1, dt * (playing ? 12 : 4));
+      c.ember.material.opacity = c.glow * (0.85 + 0.15 * Math.sin(now * 23 + c.x * 900));
+      c.ember.visible = c.glow > 0.01;
+      // while it plays, smoke pours steadily from the tip
+      if (playing && Math.random() < dt * (14 + 16 * playing.vel)) {
+        smTmp.set(c.x, packModel.top + c.y, c.z); pack.group.localToWorld(smTmp);
+        puff(smTmp, playing.vel, 1);
+      }
+    }
+  }
+}
+
+const smokeMachine = {
+  id: 'smokes', label: 'Smokes', blurb: 'Each note lifts a cigarette an inch out of the pack, its tip glowing, smoke pouring out while the note holds. Made for slow wind melodies. Drag to orbit, scroll to zoom.',
+  wide: 2.8,
+  lead: () => SMOKE_LEAD + 0.1,
+  stage: () => ({ env: squishEnv, bg: SMOKE_BG, fog: null, backdrop: smBackdrop }),
+  enter() {
+    smokeWorld.visible = true; scene.background = SMOKE_BG; scene.fog = null; scene.environment = squishEnv; setBloom(0.6, 0.5, 1.1);
+    Object.assign(orbit, { theta: 0.25, phi: 0.32, r: this.wide }); orbit.target.set(0, 0.85, 0);
+  },
+  exit() { smokeWorld.visible = false; scene.environment = null; },
+  load(entry) {
+    if (!entry.smokeMap) defaultSmokeMap(entry);
+    loadPackModel().then(() => { if (current === entry && machine === smokeMachine) { buildPacks(entry); renderParts(entry); orbit.r = this.wide; } })
+      .catch(err => setStatus(`Couldn't load the cigarette pack: ${err.message}.`));
+    buildPacks(entry);
+  },
+  refresh(entry) { buildPacks(entry); },
+  schedule(e, hitAbs, entry) {
+    const id = entry.smokeMap[e.part];
+    if (!id || id === 'off') return;
+    const vel = e.vel / 127, d = FX.hold && e.dur ? e.dur : 0.45;
+    smokeNotes.push({ pack: id, note: e.note, t: hitAbs, end: hitAbs + d, vel, h: vary(0.25) });
+    if (!soundOn || !actx) return;
+    const t = actx.currentTime + Math.max(0, hitAbs - nowSec()), k = Number(id.slice(1)), n = Math.max(1, packs.length);
+    if (!kitPlay(e.note, t, vel, FX.hold && e.dur ? e.dur : null)) smokeVoice(e.note, t, vel, d, clamp((k - (n - 1) / 2) * 0.5, -0.7, 0.7));
+  },
+  live(note, vel) {
+    if (!packs.length) return false;
+    const t = nowSec() + SMOKE_LEAD + 0.05, pack = packs.reduce((m, p) => (Math.abs((p.lo + p.hi) / 2 - note) < Math.abs((m.lo + m.hi) / 2 - note) ? p : m), packs[0]);
+    smokeNotes.push({ pack: pack.id, note, t, end: t + 0.6, vel: vel / 127, h: vary(0.25) });
+    if (soundOn && actx && !kitPlay(note, actx.currentTime + SMOKE_LEAD + 0.05, vel / 127, 0.6)) smokeVoice(note, actx.currentTime + SMOKE_LEAD + 0.05, vel / 127, 0.6, 0);
+    return true;
+  },
+  update(now, dt) { updatePacks(now, dt); updateSmoke(now, dt); },
+  // auto camera: the row of packs, down onto the busiest pack's cigarettes, low and close, or from the side
+  pickShot() {
+    const busy = packs.reduce((m, p) => (!m || p.heat > m.heat ? p : m), null), roll = Math.random();
+    if (!busy || busy.heat < 0.4 || roll < 0.3) return { theta: (Math.random() - 0.5) * 0.7, phi: 0.3, r: this.wide, target: V(0, 0.85, 0), drift: 0.02 };
+    const bp = busy.group.position;
+    if (roll < 0.65) return { theta: busy.group.rotation.y + (Math.random() - 0.5) * 0.5, phi: 0.75, r: 1.5, target: V(bp.x, 0.95, bp.z), drift: 0.03 };
+    if (roll < 0.85) return { theta: busy.group.rotation.y + (Math.random() - 0.5) * 0.6, phi: 0.08, r: 1.7, target: V(bp.x, 0.9, bp.z), drift: 0.02 };
+    return { theta: 1.2 * (Math.random() < 0.5 ? -1 : 1), phi: 0.25, r: this.wide * 0.8, target: V(0, 0.9, 0), drift: 0.02 };
+  },
+  inFlight: () => packs.reduce((s, p) => s + p.cigs.filter(c => c.glow > 0.05).length, 0),
+  hits: () => smokeHits,
+};
+function renderSmokeParts(entry) {
+  const list = $('#partList');
+  list.innerHTML = '';
+  const names = packs.map((p, k) => [p.id, `Pack ${k + 1}`]);
+  const free = ['p0', 'p1', 'p2', 'p3'].find(id => !packs.some(p => p.id === id));
+  entry.parts.forEach((pt, i) => list.appendChild(partRow(pt, i,
+    [...names, ...(free ? [[free, '+ New pack']] : []), ['off', 'Off']],
+    entry.smokeMap[pt.key], v => { entry.smokeMap[pt.key] = v; if (entry === current) buildPacks(entry); renderSmokeParts(entry); })));
+  $('#parts').hidden = !entry.parts.length;
+  const off = entry.parts.filter(p => entry.smokeMap[p.key] === 'off').length;
+  $('#partSummary').textContent = `${entry.parts.length} part${entry.parts.length > 1 ? 's' : ''} on ${packs.length} pack${packs.length === 1 ? '' : 's'}` + (off ? ` · ${off} off (drums sit out)` : '') + ' (click to change)';
+}
+
+const MACHINES = { pipe: pipeMachine, doll: dollMachine, squish: squishMachine, smokes: smokeMachine };
 let machine = pipeMachine;
 
 // ---------- transport ----------
@@ -3514,7 +3898,7 @@ function fmt(t) { t = Math.max(0, t); return Math.floor(t / 60) + ':' + String(M
 const NOTE_NAMES = ['C', 'C♯', 'D', 'D♯', 'E', 'F', 'F♯', 'G', 'G♯', 'A', 'A♯', 'B'];
 const noteName = n => NOTE_NAMES[n % 12] + (Math.floor(n / 12) - 1);
 
-function renderParts(entry) { return machine === dollMachine ? renderDollParts(entry) : machine === squishMachine ? renderSquishParts(entry) : renderPipeParts(entry); }
+function renderParts(entry) { return machine === dollMachine ? renderDollParts(entry) : machine === squishMachine ? renderSquishParts(entry) : machine === smokeMachine ? renderSmokeParts(entry) : renderPipeParts(entry); }
 function partRow(pt, i, options, value, onchange) {
   const row = document.createElement('div');
   row.className = 'part';
@@ -3702,6 +4086,7 @@ $('#autoAssign').onclick = () => {
   if (!current) return;
   if (machine === dollMachine) defaultDollMap(current);
   else if (machine === squishMachine) { defaultSquishMap(current); buildBlobs(current); }
+  else if (machine === smokeMachine) { defaultSmokeMap(current); buildPacks(current); }
   else { current.manual = {}; assignParts(current); buildLayout(current.specs); }
   renderParts(current);
   setStatus(`Every part of ${current.name} is mapped automatically again.`);
@@ -3848,7 +4233,7 @@ $('#kitRec').onclick = async () => {
 renderSound();
 loadTakes();
 // stage light scales every stage lamp on both machines; glow strength scales the bloom
-const STAGE_LIGHTS = [[pipeHemi, 0.35], [sun, 0.8], [core, 0.6], [dollHemi, 0.3], [rimPink, 0.8], [rimWhite, 0.5], [fill, 0.35], [sqHemi, 0.5], [sqKey, 1.4], [sqRim, 1.1]];
+const STAGE_LIGHTS = [[pipeHemi, 0.35], [sun, 0.8], [core, 0.6], [dollHemi, 0.3], [rimPink, 0.8], [rimWhite, 0.5], [fill, 0.35], [sqHemi, 0.5], [sqKey, 1.4], [sqRim, 1.1], [smHemi, 0.35], [smKey, 1.6], [smRim, 1.2]];
 // ---------- environments: Poly Haven HDRIs (CC0) that light and reflect on either machine ----------
 const ENVS = [
   ['builtin', 'Built-in'],
