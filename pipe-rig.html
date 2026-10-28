@@ -2959,11 +2959,11 @@ function updateEyes(b, now, dt) {
     e.socket.position.copy(eyeTmp.p);
     e.socket.scale.setScalar(r);
     e.socket.lookAt(eyeTmp.d.copy(eyeTmp.p).add(eyeTmp.n).add(V(0, 0, 0.9)));
-    // the eyeball turns toward the target, at most about 40 degrees off centre
+    // the eyeball turns toward the target, at most about 55 degrees off centre
     eyeTmp.d.copy(target);
     e.socket.worldToLocal(eyeTmp.d).normalize();
     const ang = eyeTmp.d.angleTo(EYE_Z);
-    if (ang > 0.7) eyeTmp.d.lerp(EYE_Z, 1 - 0.7 / ang).normalize();
+    if (ang > 0.95) eyeTmp.d.lerp(EYE_Z, 1 - 0.95 / ang).normalize();
     eyeTmp.q.setFromUnitVectors(EYE_Z, eyeTmp.d);
     e.ball.quaternion.slerp(eyeTmp.q, k);
     // pupils shrink on loud hits and open wide in surprise
@@ -3130,7 +3130,7 @@ function buildBlobs(entry) {
     blobs.push(b);
   });
   const width = (n - 1) * BLOB_SPOT;
-  squishMachine.wide = Math.max(4.5, width * 0.95 + 2.6);
+  squishMachine.wide = Math.max(6, width * 0.95 + 4.2);
 }
 const blobById = id => blobs.find(b => b.id === id);
 // which pressing spot a note uses: its place in the blob's range, low on the left
@@ -3147,10 +3147,10 @@ function pokeAt(b, vi, t, hold, vel, radius = 0.36) {
   const depth = (0.12 + 0.22 * vel) * vary(0.3);
   const poke = { vi, t, hold: Math.max(0.07, hold), depth, vel, idx, w, kicked: false };
   b.pokes.push(poke);
-  // the piece of jelly that makes the note: louder notes are flung higher, so they fly longer
+  // the piece of jelly that makes the note: thrown high (apex ≈ gτ²/8, about 1.2 to 2.5 above the head), louder notes higher
   let piece = b.pieces.find(p => !p.busy);
   if (!piece) { piece = { mesh: new THREE.Mesh(pieceGeo, b.mesh.material) }; piece.mesh.castShadow = true; squishWorld.add(piece.mesh); b.pieces.push(piece); }
-  Object.assign(piece, { busy: true, launched: false, snapped: false, sticky: Math.random() < 0.45, poke, tau: (0.42 + 0.3 * vel) * vary(0.2) });
+  Object.assign(piece, { busy: true, launched: false, snapped: false, sticky: Math.random() < 0.45, poke, tau: (1.0 + 0.45 * vel) * vary(0.15) });
   piece.mesh.visible = false;
   return poke;
 }
@@ -3266,13 +3266,13 @@ function stepBlob(b, now, dt) {
   b.mesh.material.emissiveIntensity = FX.lights ? Math.min(0.5, b.heat * 0.25) : 0;
 }
 // each piece leaves the top of the head at t − τ on the arc v0 = (P − L)/τ − ½gτ, so it lands on its spot at t;
-// it splats onto the head, sits there through the note and sinks back in
-const SQ_LEAD = 0.85;
+// it splats onto the head and is absorbed straight away; a held note keeps the dent pressed for its length
+const SQ_LEAD = 1.75;
 function updatePieces(b, now) {
-  const s = b.mesh.scale.x, r = 0.13 * s;
+  const s = b.mesh.scale.x, r = 0.17 * s;
   for (const p of b.pieces) {
     if (!p.busy) continue;
-    const k = p.poke, t0 = k.t - p.tau, end = k.t + k.hold + 0.35;
+    const k = p.poke, t0 = k.t - p.tau, end = k.t + 0.22;
     if (now < t0 || now > end) {
       p.mesh.visible = false;
       if (p.strand) p.strand.visible = false;
@@ -3301,11 +3301,11 @@ function updatePieces(b, now) {
       const g = r * Math.min(1, 0.35 + dt * 7);
       p.mesh.scale.set(g, g * (1 + Math.min(0.7, sp * 0.1)), g);
     } else {
-      // landed: squashed flat for an instant, then rounding out while it sinks into the head and merges
-      const age = now - k.t, e = age / (k.hold + 0.35), na = b.geo.attributes.normal.array, n = V(na[i3], na[i3 + 1], na[i3 + 2]).normalize();
-      p.mesh.position.copy(b.mesh.localToWorld(V(b.pos[i3], b.pos[i3 + 1], b.pos[i3 + 2]))).addScaledVector(n, r * (0.75 - 1.6 * e));
+      // landed: squashed flat on impact and sucked into the head
+      const age = now - k.t, e = Math.min(1, age / 0.22), na = b.geo.attributes.normal.array, n = V(na[i3], na[i3 + 1], na[i3 + 2]).normalize();
+      p.mesh.position.copy(b.mesh.localToWorld(V(b.pos[i3], b.pos[i3 + 1], b.pos[i3 + 2]))).addScaledVector(n, r * (0.6 - 1.8 * e));
       p.mesh.quaternion.setFromUnitVectors(UP, n);
-      const flat = 1 - 0.45 * Math.exp(-age * 14), g = r * (1 - 0.6 * e);
+      const flat = 1 - 0.5 * Math.exp(-age * 18), g = r * (1 - 0.85 * e);
       p.mesh.scale.set(g / Math.sqrt(flat), g * flat, g / Math.sqrt(flat));
     }
     updateStrand(b, p, flying);
@@ -3397,7 +3397,7 @@ const squishMachine = {
   stage: () => ({ env: squishEnv, bg: SQUISH_BG, fog: null, backdrop: sqBackdrop }),
   enter() {
     squishWorld.visible = true; scene.background = SQUISH_BG; scene.fog = null; scene.environment = squishEnv; setBloom(0.35, 0.45, 1.6);
-    Object.assign(orbit, { theta: 0, phi: 0.28, r: this.wide }); orbit.target.set(0, 0.6, 0);
+    Object.assign(orbit, { theta: 0, phi: 0.24, r: this.wide }); orbit.target.set(0, 1.3, 0);
   },
   exit() { letGo(); squishWorld.visible = false; scene.environment = null; },
   load(entry) {
@@ -3428,10 +3428,10 @@ const squishMachine = {
   // auto camera: the whole row, close on the busiest blob, low and heroic, or from above
   pickShot() {
     const busy = blobs.reduce((m, b) => (!m || b.heat > m.heat ? b : m), null), roll = Math.random();
-    if (!busy || busy.heat < 0.4 || roll < 0.3) return { theta: (Math.random() - 0.5) * 0.5, phi: 0.28, r: this.wide, target: V(0, 0.55, 0), drift: 0.02 };
+    if (!busy || busy.heat < 0.4 || roll < 0.3) return { theta: (Math.random() - 0.5) * 0.5, phi: 0.24, r: this.wide, target: V(0, 1.3, 0), drift: 0.02 };
     const bp = busy.mesh.position;
-    if (roll < 0.75) return { theta: (Math.random() - 0.5) * 0.8, phi: 0.22, r: 2.2 + busy.size, target: V(bp.x, 0.45, bp.z), drift: 0.03 };
-    if (roll < 0.9) return { theta: (Math.random() - 0.5) * 0.6, phi: 0.04, r: this.wide * 0.6, target: V(0, 0.7, 0), drift: 0.02 };
+    if (roll < 0.75) return { theta: (Math.random() - 0.5) * 0.8, phi: 0.18, r: 3.6 + busy.size, target: V(bp.x, 1.3, bp.z), drift: 0.03 };
+    if (roll < 0.9) return { theta: (Math.random() - 0.5) * 0.6, phi: 0.04, r: this.wide * 0.65, target: V(0, 1.4, 0), drift: 0.02 };
     return { theta: 0, phi: 1.1, r: this.wide * 0.8, target: V(0, 0, 0), drift: 0.03 };
   },
   inFlight: () => blobs.reduce((s, b) => s + b.pieces.filter(p => p.busy).length, 0),
