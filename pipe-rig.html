@@ -2786,9 +2786,9 @@ const dollMachine = {
 };
 
 
-// ---------- squish: gummy soft bodies, each pressed by a pearl on every note ----------
-// Each part of the song gets a translucent blob. A note drops a pearl that presses into the blob exactly on
-// the beat; the blob is a spring-mass soft body, so it dents, bulges, wobbles and settles on its own. The
+// ---------- squish: gummy soft bodies that play themselves ----------
+// Each part of the song gets a translucent blob. For every note the blob spits a small round piece of itself
+// up off its head, on an arc timed to land back on its head exactly on the beat, and the landing is the note; the blob is a spring-mass soft body, so it dents, bulges, wobbles and settles on its own. The
 // sound comes from the shape: the voice's vowel opens and closes with the blob's squash and its pitch bends
 // with the wobble. Drag a blob to pull it and it sings, higher the further it stretches.
 const squishWorld = new THREE.Group();
@@ -2869,7 +2869,7 @@ const SQ = (() => {
       lap[i * 3 + k] = s / c - rest[i * 3 + k];
     }
   }
-  // spots along the top that a pearl can press, low notes on the left to high on the right
+  // spots along the top where a spat piece lands, low notes on the left to high on the right
   const normal = Float32Array.from(g.attributes.normal.array), slots = [];
   for (let s = 0; s < 25; s++) {
     const u = s / 24, d = V(-0.78 + 1.56 * u, 0.9, 0.38).normalize();
@@ -2883,12 +2883,22 @@ const GUMMY = [0xd0102a, 0x1f9e2c, 0xff6a00, 0x6a1fb8, 0xf2c200, 0x0a7fd8];
 const BLOB_SPOT = 1.9;   // spacing between blobs
 const blobs = [];
 let sqHits = 0, sqLastRipple = -10;
-const pearlGeo = new THREE.SphereGeometry(0.11, 24, 16);
-const pearlMat = new THREE.MeshPhysicalMaterial({ color: 0xf4f0ff, metalness: 0.15, roughness: 0.12, clearcoat: 1, iridescence: 1, iridescenceIOR: 1.6, iridescenceThicknessRange: [180, 620] });
+const pieceGeo = new THREE.SphereGeometry(1, 24, 16);
+// the top of the head, where pieces are spat from, and the jelly around it that puckers as one leaves
+const SQ_TOP = (() => {
+  let top = 0;
+  for (let i = 0; i < SQ.n; i++) if (SQ.rest[i * 3 + 1] > SQ.rest[top * 3 + 1]) top = i;
+  const r = SQ.rest, idx = [], w = [];
+  for (let i = 0; i < SQ.n; i++) {
+    const d = Math.hypot(r[i * 3] - r[top * 3], r[i * 3 + 1] - r[top * 3 + 1], r[i * 3 + 2] - r[top * 3 + 2]);
+    if (d < 0.4) { idx.push(i); w.push(Math.pow(Math.cos((d / 0.4) * Math.PI / 2), 2)); }
+  }
+  return { vi: top, idx, w };
+})();
 
 // ---------- eyes: glossy eyeballs set into each blob, with lids that blink, squint and widen ----------
 // The eyes ride on two points of the soft body, so they bob and tilt with every squash. Each eyeball turns
-// toward what's happening (the next pearl about to land, the viewer, a neighbour) with quick saccades.
+// toward what's happening (its own piece flying up and coming down, the viewer, a neighbour) with quick saccades.
 const EYE_SPOTS = [-1, 1].map(side => {
   const d = V(0.4 * side, 0.4, 0.84).normalize();
   let best = 0, bd = -2;
@@ -2918,9 +2928,9 @@ function makeEyes(b) {
 }
 const eyeTmp = { n: V(0, 0, 0), p: V(0, 0, 0), d: V(0, 0, 0), q: new THREE.Quaternion() };
 function updateEyes(b, now, dt) {
-  // what to look at: the next pearl falling onto this blob, otherwise wander between the viewer, a neighbour and the room
+  // what to look at: the next piece in the air above this blob, otherwise wander between the viewer, a neighbour and the room
   let target = null, soonest = Infinity;
-  for (const p of b.pearls) if (p.busy && p.mesh.visible && p.poke.t >= now - 0.05 && p.poke.t < soonest) { soonest = p.poke.t; target = p.mesh.position; }
+  for (const p of b.pieces) if (p.busy && p.mesh.visible && p.poke.t >= now - 0.05 && p.poke.t < soonest) { soonest = p.poke.t; target = p.mesh.position; }
   if (!target) {
     if (now > b.idleUntil) {
       const roll = Math.random(), other = blobs[Math.floor(Math.random() * blobs.length)];
@@ -2964,7 +2974,7 @@ function updateEyes(b, now, dt) {
 }
 // ---------- splashes: droplets flung from every hit that land as little splats, and sticky strands ----------
 // Droplets fly on real ballistic arcs, stretched along their speed, and flatten into splats that spread and
-// shrink away; each landing ticks faintly. After a long press the pearl lifts off with a strand of jelly that
+// shrink away; each landing ticks faintly. Some pieces leave the head trailing a strand of jelly that
 // stretches thin and snaps, dropping a few beads.
 const dropGeo = new THREE.SphereGeometry(1, 14, 10);
 const strandGeo = new THREE.CylinderGeometry(1, 1, 1, 10, 1, true);
@@ -2993,7 +3003,7 @@ function spawnDrops(b, at, normal, vel, n, speedScale = 1) {
 }
 function updateSplash(b, now, dt) {
   const s = b.splash, t = dropTmp;
-  s.drops = s.drops.filter(d => !d.dead && (d.landed ? now - d.landT < 1.7 : now - d.born < 4));
+  s.drops = s.drops.filter(d => !d.dead && (d.landed ? now - d.landT < 1.1 : now - d.born < 4));
   s.drops.forEach((d, i) => {
     if (!d.landed) {
       d.v.y -= 9.8 * dt;
@@ -3019,9 +3029,9 @@ function updateSplash(b, now, dt) {
       t.s.set(d.r, d.r * (1 + Math.min(2.2, sp * 0.18)), d.r);
     } else {
       // a splat: it spreads out fast, sits a moment, then shrinks away
-      const age = now - d.landT, spread = 1 + 1.3 * Math.min(1, age * 9), fade = age < 1 ? 1 : Math.max(0, 1 - (age - 1) / 0.7);
+      const age = now - d.landT, spread = 1 + 0.6 * Math.min(1, age * 9), fade = age < 0.5 ? 1 : Math.max(0, 1 - (age - 0.5) / 0.6);
       t.q.identity();
-      t.s.set(d.r * 1.6 * spread * fade, d.r * 0.22 * fade + 0.0001, d.r * 1.6 * spread * fade);
+      t.s.set(d.r * 1.3 * spread * fade, d.r * 0.22 * fade + 0.0001, d.r * 1.3 * spread * fade);
     }
     t.m.compose(d.p, t.q, t.s);
     s.inst.setMatrixAt(i, t.m);
@@ -3029,21 +3039,21 @@ function updateSplash(b, now, dt) {
   s.inst.count = s.drops.length;
   s.inst.instanceMatrix.needsUpdate = true;
 }
-// the strand between a lifting pearl and the jelly it pressed into
-function updateStrand(b, p, contact, nrm, up) {
+// the strand of jelly a piece sometimes drags up off the head as it leaves
+function updateStrand(b, p, flying) {
   if (!p.strand) { p.strand = new THREE.Mesh(strandGeo, b.splash.mat); p.strand.castShadow = true; squishWorld.add(p.strand); }
-  const sticky = p.poke.hold > 0.25 && !p.snapped && up >= 0;
-  p.strand.visible = sticky;
-  if (!sticky) return;
-  const from = contact.clone().addScaledVector(nrm, -0.1), to = p.mesh.position, len = from.distanceTo(to);
-  if (len > 0.55) {
+  const show = p.sticky && !p.snapped && flying;
+  p.strand.visible = show;
+  if (!show) return;
+  const t = SQ_TOP.vi * 3, from = b.mesh.localToWorld(V(b.pos[t], b.pos[t + 1], b.pos[t + 2])), to = p.mesh.position, len = from.distanceTo(to);
+  if (len > 0.5) {
     // it snaps: the strand is gone and a few beads fall from where it broke
     p.snapped = true; p.strand.visible = false;
-    spawnDrops(b, from.clone().lerp(to, 0.5), V(0, -0.3, 0), 0.2, 4, 0.4);
-    if (soundOn && actx) { const at = actx.currentTime + 0.005; osc('sine', 900, at, 0.05, out(at, 0.06, 0.05), 2400); }
+    spawnDrops(b, from.clone().lerp(to, 0.5), V(0, -0.3, 0), 0.2, 3, 0.4);
+    if (soundOn && actx) { const at = actx.currentTime + 0.005; osc('sine', 900, at, 0.05, out(at, 0.05, 0.05), 2400); }
     return;
   }
-  const rad = 0.04 * (1 - len / 0.62) + 0.006;
+  const rad = 0.035 * (1 - len / 0.56) + 0.006;
   p.strand.position.copy(from).lerp(to, 0.5);
   p.strand.quaternion.setFromUnitVectors(UP, dropTmp.d.copy(to).sub(from).normalize());
   p.strand.scale.set(rad, len, rad);
@@ -3067,7 +3077,7 @@ function makeBlob(i, info) {
   squishWorld.add(mesh);
   const b = {
     i, mesh, geo, pos, vel: new Float32Array(pos.length), off: new Float32Array(pos.length), dent: new Float32Array(SQ.n), color,
-    q: 0, qv: 0, heat: 0, pokes: [], pearls: [], voices: [], ...info,
+    q: 0, qv: 0, heat: 0, pokes: [], pieces: [], voices: [], ...info,
   };
   makeEyes(b);
   makeSplash(b);
@@ -3076,7 +3086,7 @@ function makeBlob(i, info) {
 function clearBlobs() {
   for (const b of blobs) {
     squishWorld.remove(b.mesh); b.geo.dispose(); b.mesh.material.dispose();
-    for (const p of b.pearls) { squishWorld.remove(p.mesh); if (p.strand) squishWorld.remove(p.strand); }
+    for (const p of b.pieces) { squishWorld.remove(p.mesh); if (p.strand) squishWorld.remove(p.strand); }
     squishWorld.remove(b.splash.inst); b.splash.mat.dispose();
     for (const e of b.eyes) squishWorld.remove(e.socket);
     b.lidMat.dispose();
@@ -3137,11 +3147,11 @@ function pokeAt(b, vi, t, hold, vel, radius = 0.36) {
   const depth = (0.12 + 0.22 * vel) * vary(0.3);
   const poke = { vi, t, hold: Math.max(0.07, hold), depth, vel, idx, w, kicked: false };
   b.pokes.push(poke);
-  // the pearl that does the pressing, falling in from above so it lands exactly at t
-  let pearl = b.pearls.find(p => !p.busy);
-  if (!pearl) { pearl = { mesh: new THREE.Mesh(pearlGeo, pearlMat) }; pearl.mesh.castShadow = true; squishWorld.add(pearl.mesh); b.pearls.push(pearl); }
-  Object.assign(pearl, { busy: true, snapped: false, poke, from: V((Math.random() - 0.5) * 0.6, 1.6 + Math.random() * 0.5, 0.2 + Math.random() * 0.4) });
-  pearl.mesh.visible = false;
+  // the piece of jelly that makes the note: louder notes are flung higher, so they fly longer
+  let piece = b.pieces.find(p => !p.busy);
+  if (!piece) { piece = { mesh: new THREE.Mesh(pieceGeo, b.mesh.material) }; piece.mesh.castShadow = true; squishWorld.add(piece.mesh); b.pieces.push(piece); }
+  Object.assign(piece, { busy: true, launched: false, snapped: false, sticky: Math.random() < 0.45, poke, tau: (0.42 + 0.3 * vel) * vary(0.2) });
+  piece.mesh.visible = false;
   return poke;
 }
 
@@ -3211,7 +3221,7 @@ function stepBlob(b, now, dt) {
       b.qv += 0.45 * p.vel * vary(0.4); b.heat += p.vel; b.squint = Math.max(b.squint, 0.3 + 0.55 * p.vel); sqHits++; grooveHit(p.vel);
       const wp = b.mesh.localToWorld(V(pos[p.vi * 3], pos[p.vi * 3 + 1], pos[p.vi * 3 + 2]));
       flashAt(wp, b.color, p.vel, 2.4, 8, 0.5);
-      spawnDrops(b, wp, V(nrm[p.vi * 3], nrm[p.vi * 3 + 1], nrm[p.vi * 3 + 2]), p.vel, Math.round(1 + p.vel * 6));
+      spawnDrops(b, wp, V(nrm[p.vi * 3], nrm[p.vi * 3 + 1], nrm[p.vi * 3 + 2]), p.vel, Math.round(1 + p.vel * 4));
       if (p.vel > 0.7 && now - sqLastRipple > 0.7) {
         sqLastRipple = now;
         const rp = sqRipples[sqRippleIdx++ % sqRipples.length];
@@ -3255,21 +3265,50 @@ function stepBlob(b, now, dt) {
   b.heat *= Math.exp(-dt * 0.9);
   b.mesh.material.emissiveIntensity = FX.lights ? Math.min(0.5, b.heat * 0.25) : 0;
 }
-// pearls fall on an accelerating path, press in for the note, then lift away and shrink
-const SQ_LEAD = 0.55;
-function updatePearls(b, now) {
-  for (const p of b.pearls) {
+// each piece leaves the top of the head at t − τ on the arc v0 = (P − L)/τ − ½gτ, so it lands on its spot at t;
+// it splats onto the head, sits there through the note and sinks back in
+const SQ_LEAD = 0.85;
+function updatePieces(b, now) {
+  const s = b.mesh.scale.x, r = 0.13 * s;
+  for (const p of b.pieces) {
     if (!p.busy) continue;
-    const k = p.poke, surf = b.mesh.localToWorld(V(b.pos[k.vi * 3], b.pos[k.vi * 3 + 1], b.pos[k.vi * 3 + 2]));
-    const nrm = V(SQ.normal[k.vi * 3], SQ.normal[k.vi * 3 + 1], SQ.normal[k.vi * 3 + 2]);
-    const contact = surf.addScaledVector(nrm, 0.11);
-    const u = (now - (k.t - SQ_LEAD)) / SQ_LEAD, up = now - (k.t + k.hold);
-    p.mesh.visible = u >= 0 && up < 0.45;
-    if (!p.mesh.visible) { if (up >= 0.45) p.busy = false; if (p.strand) p.strand.visible = false; continue; }
-    if (u < 1) { p.mesh.position.copy(contact).add(p.from.clone().multiplyScalar(1 - u * u)); p.mesh.scale.setScalar(Math.min(1, u * 3)); }
-    else if (up < 0) { p.mesh.position.copy(contact); p.mesh.scale.setScalar(1); }
-    else { const e = up / 0.45; p.mesh.position.copy(contact).add(V(0, e * 1.2, 0)); p.mesh.scale.setScalar(1 - e); }
-    updateStrand(b, p, contact, nrm, up);
+    const k = p.poke, t0 = k.t - p.tau, end = k.t + k.hold + 0.35;
+    if (now < t0 || now > end) {
+      p.mesh.visible = false;
+      if (p.strand) p.strand.visible = false;
+      if (now > end) p.busy = false;
+      continue;
+    }
+    const i3 = k.vi * 3;
+    if (!p.launched) {
+      p.launched = true;
+      const tp = SQ_TOP.vi * 3;
+      p.L = b.mesh.localToWorld(V(b.pos[tp], b.pos[tp + 1], b.pos[tp + 2]));
+      const land = b.mesh.localToWorld(V(SQ.rest[i3], SQ.rest[i3 + 1], SQ.rest[i3 + 2])).addScaledVector(V(SQ.normal[i3], SQ.normal[i3 + 1], SQ.normal[i3 + 2]), r * 0.7);
+      p.v0 = solveV0(p.L, land, p.tau, V(0, 0, 0));
+      // spitting it out: the top puckers up for a moment, the body hops, and a couple of specks fly
+      b.pokes.push({ vi: SQ_TOP.vi, t: now, hold: 0.07, depth: -0.1 * (0.6 + k.vel), vel: 0, idx: SQ_TOP.idx, w: SQ_TOP.w, kicked: true });
+      b.qv -= 0.4 + 0.5 * k.vel;
+      spawnDrops(b, p.L, UP, 0.1, 2, 0.5);
+    }
+    p.mesh.visible = true;
+    const flying = now < k.t;
+    if (flying) {
+      // on its arc, stretched along the way it's going and swelling out of the head as it leaves
+      const dt = now - t0, v = dropTmp.d.copy(p.v0).addScaledVector(G, dt), sp = v.length();
+      p.mesh.position.copy(p.L).addScaledVector(p.v0, dt).addScaledVector(G, 0.5 * dt * dt);
+      p.mesh.quaternion.setFromUnitVectors(UP, v.divideScalar(sp || 1));
+      const g = r * Math.min(1, 0.35 + dt * 7);
+      p.mesh.scale.set(g, g * (1 + Math.min(0.7, sp * 0.1)), g);
+    } else {
+      // landed: squashed flat for an instant, then rounding out while it sinks into the head and merges
+      const age = now - k.t, e = age / (k.hold + 0.35), na = b.geo.attributes.normal.array, n = V(na[i3], na[i3 + 1], na[i3 + 2]).normalize();
+      p.mesh.position.copy(b.mesh.localToWorld(V(b.pos[i3], b.pos[i3 + 1], b.pos[i3 + 2]))).addScaledVector(n, r * (0.75 - 1.6 * e));
+      p.mesh.quaternion.setFromUnitVectors(UP, n);
+      const flat = 1 - 0.45 * Math.exp(-age * 14), g = r * (1 - 0.6 * e);
+      p.mesh.scale.set(g / Math.sqrt(flat), g * flat, g / Math.sqrt(flat));
+    }
+    updateStrand(b, p, flying);
   }
 }
 // the vowel opens as the body stretches and closes as it squashes; the pitch bends with the wobble
@@ -3352,7 +3391,7 @@ canvas.addEventListener('pointerup', letGo, { capture: true });
 canvas.addEventListener('pointercancel', letGo, { capture: true });
 
 const squishMachine = {
-  id: 'squish', label: 'Squish', blurb: 'Every note drops a pearl that presses into a gummy blob right on the beat. Drag a blob to pull it and make it sing; drag the background to orbit.',
+  id: 'squish', label: 'Squish', blurb: 'Each gummy blob spits a piece of itself into the air, and it lands back on its head right on the beat: that landing is the note. Drag a blob to pull it and make it sing; drag the background to orbit.',
   wide: 7,
   lead: () => SQ_LEAD + 0.1,
   stage: () => ({ env: squishEnv, bg: SQUISH_BG, fog: null, backdrop: sqBackdrop }),
@@ -3380,7 +3419,7 @@ const squishMachine = {
     return true;
   },
   update(now, dt) {
-    for (const b of blobs) { stepBlob(b, now, dt); updatePearls(b, now); updateEyes(b, now, dt); updateSplash(b, now, dt); shapeVoices(b); }
+    for (const b of blobs) { stepBlob(b, now, dt); updatePieces(b, now); updateEyes(b, now, dt); updateSplash(b, now, dt); shapeVoices(b); }
     const u = sqBackdrop.material.uniforms;
     u.u_time.value = now;
     sqRipples.forEach((r, k) => { u.u_t0.value[k] = r.t0; });
@@ -3395,7 +3434,7 @@ const squishMachine = {
     if (roll < 0.9) return { theta: (Math.random() - 0.5) * 0.6, phi: 0.04, r: this.wide * 0.6, target: V(0, 0.7, 0), drift: 0.02 };
     return { theta: 0, phi: 1.1, r: this.wide * 0.8, target: V(0, 0, 0), drift: 0.03 };
   },
-  inFlight: () => blobs.reduce((s, b) => s + b.pearls.filter(p => p.busy).length, 0),
+  inFlight: () => blobs.reduce((s, b) => s + b.pieces.filter(p => p.busy).length, 0),
   hits: () => sqHits,
 };
 function renderSquishParts(entry) {
