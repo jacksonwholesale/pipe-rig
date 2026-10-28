@@ -91,6 +91,12 @@ body[data-machine="doll"] .hud p, body[data-machine="doll"] .telemetry, body[dat
 body[data-machine="doll"] .hud h1 { color: #d81b72; }
 .dial { display: inline-flex; align-items: center; gap: 8px; font-size: 0.8rem; color: var(--muted); }
 .dial input { width: 110px; accent-color: var(--copper); }
+.take { display: inline-flex; align-items: center; gap: 2px; padding: 2px 4px; border: 1px solid #2c3647; border-radius: 999px; font-size: 0.78rem; }
+.take button { padding: 2px 8px; font-size: 0.78rem; border-radius: 999px; }
+.take .tdel, .take .tplay { border-color: transparent; background: none; }
+.take .tmeta { color: var(--muted); padding: 0 4px; }
+#kitTools { display: inline-flex; gap: 6px; flex-wrap: wrap; }
+button.rec { border-color: #e2554f; color: #ff8a84; }
 .showpanel { position: fixed; bottom: calc(env(safe-area-inset-bottom, 0px) + 14px); left: max(16px, env(safe-area-inset-left, 0px)); background: var(--panel); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); }
 body.dropping #stage { outline: 3px dashed var(--copper); outline-offset: -12px; }
 @media (max-width: 560px) {
@@ -155,6 +161,17 @@ body.dropping #stage { outline: 3px dashed var(--copper); outline-offset: -12px;
     <label class="dial" for="grooveAmt">Groove amount <input id="grooveAmt" type="range" min="0" max="2" step="0.05"></label>
     <label class="dial" for="envSel">Environment <select id="envSel"></select></label>
     <label class="check"><input type="checkbox" id="envBg"> Show as backdrop</label>
+  </div>
+  <div class="row" id="soundRow">
+    <span class="label">Sound</span>
+    <label class="dial" for="soundSel">Sound source <select id="soundSel"></select></label>
+    <label class="check" title="Off: the drum parts play on the sound source too"><input type="checkbox" id="keepDrums"> Keep drums as drums</label>
+    <span id="kitTools" hidden>
+      <label class="filebtn">Add sounds…<input id="kitIn" type="file" multiple accept="audio/*,.wav,.mp3,.ogg,.m4a,.flac,.webm"></label>
+      <button id="kitRec" title="Record from your microphone; each sound you make becomes its own take">Record</button>
+      <button id="kitClear" title="Remove all your takes">Clear</button>
+    </span>
+    <span class="chips" id="kitTakes" hidden></span>
   </div>
   <div class="row">
     <span class="label">Live</span>
@@ -359,6 +376,7 @@ function ensureAudio() {
     const d = noiseBuf.getChannelData(0);
     for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
     preloadSamples();
+    prepareKit();
   }
   if (actx.state === 'suspended') actx.resume();
 }
@@ -539,13 +557,278 @@ function samplePlay(kind, midi, t, vel, d) {
   src.connect(g).connect(master); src.start(t); src.stop(t + end + 0.05);
   return true;
 }
-// one note on one instrument kind: the recorded sample when it's loaded, otherwise the synth voice
+// one note on one instrument kind: the sound kit when one is chosen, else the recorded sample when it's loaded, else the synth voice
 function playNote(kind, midi, hitAbs, vel, dur) {
   if (!soundOn || !actx) return;
   const t = actx.currentTime + Math.max(0, hitAbs - nowSec());
   const d = FX.hold && dur ? dur : null;
+  if (kitPlay(midi, t, vel, d)) return;
   if (FX.samples && samplePlay(kind, midi, t, vel, d)) return;
   (VOICES[kind] || VOICES.marimba)(mtof(midi))(t, vel, d);
+}
+
+// ---------- sound kits: one source sound plays every note of the song ----------
+// Short notes trigger a hit, held notes a scrape that slides into pitch and lasts the note. Pitched takes are
+// re-pitched to the note; unpitched clatter also strikes a body tuned to it, so even noise carries the
+// melody. Every note varies: a different take than the last, a few cents off, brighter when louder, its own spot
+// in the stereo field, and now and then a flam, a wobbling blade, a settling rattle, a squeal or a parting shing.
+const SOUND_SOURCES = [
+  ['instruments', 'Instrument sounds'],
+  ['swords', 'Clanking swords'],
+  ['mine', 'My sounds'],
+];
+const SOUND = { source: 'instruments', keepDrums: true };
+try {
+  const saved = JSON.parse(localStorage.getItem('pipeRig.sound'));
+  if (saved && SOUND_SOURCES.some(([n]) => n === saved.source)) Object.assign(SOUND, { source: saved.source, keepDrums: saved.keepDrums !== false });
+} catch { /* instrument sounds */ }
+// a take: { buffer, type: 'hit' | 'scrape', midi (fractional; null when it has no clear pitch), name }
+const kits = { swords: { takes: [], hits: [], scrapes: [] }, mine: { takes: [], hits: [], scrapes: [] } };
+const rnd = (a, b) => a + Math.random() * (b - a);
+const SCRAPE_FROM = 0.4;   // notes held at least this long (seconds) scrape instead of hitting
+function sortTakes(kit) {
+  kit.hits = kit.takes.filter(c => c.type === 'hit');
+  kit.scrapes = kit.takes.filter(c => c.type === 'scrape');
+}
+function activeKit() {
+  const kit = kits[SOUND.source];
+  return kit && kit.takes.length ? kit : null;
+}
+const monoBuffer = (len, sr = 44100) => new AudioBuffer({ length: Math.max(1, len), sampleRate: sr, numberOfChannels: 1 });
+function normalize(d, to = 0.9) {
+  let peak = 0;
+  for (let i = 0; i < d.length; i++) peak = Math.max(peak, Math.abs(d[i]));
+  if (peak > 0) for (let i = 0; i < d.length; i++) d[i] *= to / peak;
+}
+
+// --- the built-in kit, generated here: large blades struck together and dragged along each other ---
+// a blade's bending modes sit at the free-bar ratios; each gets a slightly detuned twin so it shimmers
+const BLADE_MODES = [[1, 1, 1.5], [2.756, 0.32, 0.7], [5.404, 0.24, 0.4], [8.933, 0.16, 0.24], [13.34, 0.1, 0.14]];
+function swordHit(base) {
+  const sr = 44100, len = Math.floor(sr * 2.2), buf = monoBuffer(len, sr), d = buf.getChannelData(0), f0 = mtof(base);
+  for (const [m, a, dec] of BLADE_MODES) {
+    if (f0 * m > sr / 2.4) continue;
+    for (const twin of [1, 1 + rnd(0.0015, 0.0045)]) {
+      const w = 2 * Math.PI * f0 * m * twin * rnd(0.996, 1.004) / sr, ph = Math.random() * 6.28;
+      const k = Math.exp(-1 / (dec * rnd(0.7, 1.3) * sr));
+      let e = a * rnd(0.6, 1.1) * 0.5;
+      for (let i = 0; i < len; i++, e *= k) d[i] += e * Math.sin(w * i + ph);
+    }
+  }
+  // the clack of contact: a few milliseconds of bright noise
+  let lp = 0;
+  for (let i = 0, n = Math.floor(sr * 0.015); i < n; i++) { const x = Math.random() * 2 - 1; lp += (x - lp) * 0.5; d[i] += (x - lp) * 1.1 * Math.exp(-i / (sr * 0.003)); }
+  normalize(d);
+  return buf;
+}
+// stick-slip: the edge catches and lets go dozens of times a second, each slip ringing the blade's modes
+function swordScrape(base) {
+  const sr = 44100, len = sr * 4, buf = monoBuffer(len, sr), d = buf.getChannelData(0), f0 = mtof(base);
+  const ex = new Float32Array(len);
+  let next = 0, slip = 0, pressure = 0.7, rate = rnd(35, 60), grit = 0;
+  for (let i = 0; i < len; i++) {
+    if (i % 512 === 0) { pressure = clamp(pressure + rnd(-0.12, 0.12), 0.35, 1); rate = clamp(rate + rnd(-6, 6), 25, 90); }
+    if (i >= next) { next = i + Math.floor(sr / (rate * rnd(0.6, 1.4))); slip = pressure * rnd(0.5, 1); }
+    const x = Math.random() * 2 - 1;
+    grit += (x - grit) * 0.3;
+    ex[i] = slip * x + (x - grit) * 0.12 * pressure;
+    slip *= 0.985;
+  }
+  const out = new Float32Array(len);
+  for (const [m, a] of BLADE_MODES) {
+    const f = f0 * m;
+    if (f > sr / 2.4) continue;
+    const r = Math.exp(-1 / (0.12 * sr)), c = 2 * r * Math.cos(2 * Math.PI * f / sr), r2 = r * r, y = new Float32Array(len);
+    let y1 = 0, y2 = 0, peak = 1e-9;
+    for (let i = 0; i < len; i++) { const v = ex[i] + c * y1 - r2 * y2; y2 = y1; y1 = v; y[i] = v; peak = Math.max(peak, Math.abs(v)); }
+    for (let i = 0; i < len; i++) out[i] += a * y[i] / peak;
+  }
+  for (let i = 0; i < len; i++) d[i] = out[i] + ex[i] * 0.08;
+  const fadeIn = sr * 0.03, fadeOut = sr * 0.08;
+  for (let i = 0; i < fadeIn; i++) d[i] *= i / fadeIn;
+  for (let i = 0; i < fadeOut; i++) d[len - 1 - i] *= i / fadeOut;
+  normalize(d);
+  return buf;
+}
+function buildSwords() {
+  const kit = kits.swords;
+  if (kit.takes.length) return;
+  for (const base of [43, 55, 67, 79]) for (let v = 0; v < 2; v++) kit.takes.push({ buffer: swordHit(base), type: 'hit', midi: base, name: 'clank' });
+  for (const base of [50, 64, 78]) kit.takes.push({ buffer: swordScrape(base), type: 'scrape', midi: base, name: 'scrape' });
+  sortTakes(kit);
+}
+
+// --- your own takes: split a recording at its gaps, trim, level, tell hits from scrapes and find a pitch ---
+function analyzeRecording(audio, name) {
+  const sr = audio.sampleRate, n = audio.length, mono = new Float32Array(n);
+  for (let ch = 0; ch < audio.numberOfChannels; ch++) { const c = audio.getChannelData(ch); for (let i = 0; i < n; i++) mono[i] += c[i] / audio.numberOfChannels; }
+  const F = 512, frames = Math.ceil(n / F), rms = new Float32Array(frames);
+  let top = 0;
+  for (let f = 0; f < frames; f++) {
+    let s = 0, cnt = 0;
+    for (let i = f * F; i < Math.min(n, (f + 1) * F); i++, cnt++) s += mono[i] * mono[i];
+    rms[f] = Math.sqrt(s / Math.max(1, cnt)); top = Math.max(top, rms[f]);
+  }
+  if (top < 0.002) return [];
+  const thr = Math.max(0.006, top * 0.08), gap = Math.ceil(0.15 * sr / F), segs = [];
+  for (let f = 0; f < frames; f++) {
+    if (rms[f] < thr) continue;
+    const last = segs[segs.length - 1];
+    if (last && f - last[1] <= gap) last[1] = f; else segs.push([f, f]);
+  }
+  const takes = [];
+  for (const [a, b] of segs) {
+    if ((b - a + 1) * F < 0.04 * sr) continue;   // a click, not a sound
+    const s = Math.max(0, a * F - Math.floor(0.01 * sr)), e = Math.min(n, (b + 1) * F + Math.floor(0.06 * sr));
+    const buf = monoBuffer(e - s, sr), d = buf.getChannelData(0);
+    d.set(mono.subarray(s, e));
+    const fade = Math.min(d.length, Math.floor(0.012 * sr));
+    for (let i = 0; i < fade; i++) d[d.length - 1 - i] *= i / fade;
+    normalize(d);
+    // a long sound that keeps its energy is a scrape; a sound that dies away is a hit
+    const half = Math.floor(d.length / 2);
+    let e1 = 0, e2 = 0;
+    for (let i = 0; i < d.length; i++) if (i < half) e1 += d[i] * d[i]; else e2 += d[i] * d[i];
+    const type = buf.duration > 0.6 && e2 > e1 * 0.35 ? 'scrape' : 'hit';
+    takes.push({ buffer: buf, type, midi: detectPitch(d, sr), name });
+    if (takes.length >= 12) break;
+  }
+  return takes;
+}
+// normalized autocorrelation a little after the attack; the first strong peak is the period
+function detectPitch(d, sr) {
+  const start = Math.floor(sr * 0.03), N = Math.min(2048, d.length - start);
+  if (N < 600) return null;
+  const minLag = Math.floor(sr / 1500), maxLag = Math.min(Math.floor(sr / 55), Math.floor(N / 2)), nsdf = new Float32Array(maxLag + 2);
+  let max = 0;
+  for (let lag = minLag; lag <= maxLag; lag++) {
+    let ac = 0, en = 0;
+    for (let i = 0; i < N - lag; i++) { const x = d[start + i], y = d[start + i + lag]; ac += x * y; en += x * x + y * y; }
+    nsdf[lag] = en ? 2 * ac / en : 0;
+    max = Math.max(max, nsdf[lag]);
+  }
+  if (max < 0.8) return null;
+  for (let lag = minLag + 1; lag < maxLag; lag++) {
+    if (nsdf[lag] >= 0.9 * max && nsdf[lag] >= nsdf[lag - 1] && nsdf[lag] >= nsdf[lag + 1]) {
+      const a = nsdf[lag - 1], b = nsdf[lag], c = nsdf[lag + 1], shift = (a - c) / (2 * (a - 2 * b + c) || 1);
+      return 69 + 12 * Math.log2(sr / (lag + shift) / 440);
+    }
+  }
+  return null;
+}
+
+// --- playing a note on the kit ---
+function pickTake(list, midi, avoid) {
+  let best = null, bestScore = Infinity;
+  for (const c of list) {
+    const s = (c.midi == null ? 0 : Math.abs(c.midi - midi)) + Math.random() * 5 + (c === avoid ? 40 : 0);
+    if (s < bestScore) { bestScore = s; best = c; }
+  }
+  return best;
+}
+// pitched takes move to the note; unpitched ones only lean toward it and let the resonators carry the pitch
+const takeRate = (c, midi) => clamp(c.midi == null ? Math.pow(2, clamp(midi - 60, -24, 24) / 24) : Math.pow(2, (midi - c.midi) / 12), 0.125, 8);
+// unpitched takes strike a tuned body: a short harmonic ring at the note, which the clatter excites
+const bodies = {};
+function tunedBody(midi) {
+  if (bodies[midi]) return bodies[midi];
+  const sr = actx.sampleRate, len = Math.floor(sr * 0.7), buf = actx.createBuffer(1, len, sr), d = buf.getChannelData(0), f = mtof(midi);
+  for (let k = 1; k <= 8 && f * k < sr / 2.4; k++) {
+    const w = 2 * Math.PI * f * k / sr, a = 1 / k, dec = Math.exp(-1 / (sr * 0.28 / Math.sqrt(k)));
+    let e = a;
+    for (let i = 0; i < len; i++, e *= dec) d[i] += e * Math.sin(w * i);
+  }
+  return bodies[midi] = buf;
+}
+// source -> (tuned body) -> brightness -> level -> stereo spot -> master
+function kitChain(take, midi, vel, pan) {
+  const lp = filt('lowpass', clamp(1200 + 15000 * Math.pow(vel, 1.4) * rnd(0.75, 1.25), 600, 18000), 0.7), g = actx.createGain();
+  lp.connect(g);
+  if (actx.createStereoPanner) { const p = actx.createStereoPanner(); p.pan.value = clamp(pan, -0.9, 0.9); g.connect(p).connect(master); }
+  else g.connect(master);
+  if (take.midi != null) return { input: lp, g };
+  const input = actx.createGain(), dry = actx.createGain(), body = actx.createConvolver(), wet = actx.createGain();
+  dry.gain.value = 0.25; wet.gain.value = 3 * Math.pow(2, clamp(midi - 57, 0, 36) / 26);   // high bodies ring quieter, so lift them
+  body.buffer = tunedBody(clamp(Math.round(midi), 24, 108));
+  input.connect(dry).connect(lp);
+  input.connect(body).connect(wet).connect(lp);
+  return { input, g };
+}
+const lastTake = {};
+function kitHit(kit, take, midi, t, vel, pan = rnd(-0.6, 0.6), small = false) {
+  const rate = takeRate(take, midi) * Math.pow(2, rnd(-0.12, 0.12) / 12);   // a few cents off every time
+  const src = actx.createBufferSource(), { input, g } = kitChain(take, midi, vel, pan);
+  const len = Math.min(take.buffer.duration / rate, small ? 0.25 : 3), peak = 0.5 * (0.2 + 0.8 * vel) * rnd(0.85, 1.1);
+  src.buffer = take.buffer; src.playbackRate.value = rate;
+  g.gain.setValueAtTime(peak, t);
+  g.gain.setValueAtTime(peak, t + len * 0.6);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + len);
+  // a hard hit sometimes leaves the blade wobbling: the pitch bends back and forth and settles
+  if (!small && vel > 0.6 && Math.random() < 0.3) {
+    const lfo = actx.createOscillator(), dep = actx.createGain();
+    lfo.frequency.value = rnd(5, 9);
+    dep.gain.setValueAtTime(rate * rnd(0.015, 0.035), t); dep.gain.exponentialRampToValueAtTime(0.0001, t + len);
+    lfo.connect(dep).connect(src.playbackRate); lfo.start(t); lfo.stop(t + len + 0.05);
+  }
+  src.connect(input); src.start(t, rnd(0, 0.006)); src.stop(t + len + 0.05);
+  if (small) return;
+  // a flam: a quieter grace hit just ahead of a loud one
+  const tg = t - rnd(0.025, 0.05);
+  if (vel > 0.75 && Math.random() < 0.2 && tg > actx.currentTime) kitHit(kit, pickTake(kit.hits.length ? kit.hits : kit.scrapes, midi, take), midi, tg, vel * 0.45, pan + rnd(-0.2, 0.2), true);
+  // settling: a few tiny rattles as the blade comes to rest
+  if (Math.random() < 0.22) {
+    let tr = t + rnd(0.08, 0.16), v = vel * 0.3;
+    for (let k = 2 + Math.floor(Math.random() * 3); k > 0; k--, tr += rnd(0.04, 0.09), v *= 0.6) kitHit(kit, take, midi + [12, 19, 24][k % 3], tr, v, pan, true);
+  }
+}
+function kitScrape(kit, take, midi, t, vel, d, pan = rnd(-0.6, 0.6)) {
+  const rate = takeRate(take, midi), src = actx.createBufferSource(), { input, g } = kitChain(take, midi, vel, pan);
+  const dur = take.buffer.duration, span = d * rate;
+  src.buffer = take.buffer;
+  const off = span < dur - 0.05 ? rnd(0, dur - span - 0.05) : 0;   // each drag starts from a different spot
+  if (span >= dur - off) { src.loop = true; src.loopStart = Math.min(0.15, dur * 0.1); src.loopEnd = dur; }
+  // it slides up into pitch from a little flat
+  src.playbackRate.setValueAtTime(rate * rnd(0.9, 0.96), t);
+  src.playbackRate.exponentialRampToValueAtTime(rate, t + rnd(0.05, 0.12));
+  // the hand's pressure wanders over the note
+  const peak = 0.45 * (0.25 + 0.75 * vel), end = t + Math.max(0.08, d);
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(peak, t + 0.04);
+  for (let s = t + 0.04 + rnd(0.1, 0.25); s < end - 0.1; s += rnd(0.15, 0.35)) g.gain.linearRampToValueAtTime(peak * rnd(0.6, 1.1), s);
+  g.gain.linearRampToValueAtTime(peak * 0.8, end);
+  g.gain.exponentialRampToValueAtTime(0.0001, end + 0.12);
+  // long drags sometimes squeal: a narrow resonance high up swells and fades mid-note
+  if (d > 0.7 && Math.random() < 0.4) {
+    const bp = filt('bandpass', Math.min(9000, mtof(midi) * rnd(2.9, 4.1)), 40), sg = actx.createGain(), mid = t + d * rnd(0.3, 0.6);
+    sg.gain.setValueAtTime(0, t); sg.gain.linearRampToValueAtTime(rnd(3, 6), mid); sg.gain.linearRampToValueAtTime(0, Math.min(end, mid + rnd(0.2, 0.5)));
+    src.connect(bp).connect(sg).connect(g);
+  }
+  src.connect(input); src.start(t, off); src.stop(end + 0.15);
+  // and often end with a shing as the blades part
+  if (kit.hits.length && Math.random() < 0.35) kitHit(kit, pickTake(kit.hits, midi + 12), midi + 12, end, vel * 0.5, pan, true);
+}
+// one note through the active kit; false when no kit is in use so the instrument sound plays
+function kitPlay(midi, t, vel, d) {
+  const kit = activeKit();
+  if (!kit) return false;
+  const scrape = kit.scrapes.length && (!kit.hits.length || (d != null && d >= SCRAPE_FROM));
+  const list = scrape ? kit.scrapes : kit.hits, key = scrape ? 's' : 'h';
+  const take = lastTake[key] = pickTake(list, midi, lastTake[key]);
+  if (scrape) kitScrape(kit, take, midi, t, vel, d != null ? d : 0.6);
+  else kitHit(kit, take, midi, t, vel);
+  return true;
+}
+// drum pieces on the kit: low thuds for kick and toms, a sharp hit for the snare, ticks and scrapes for the metal
+const KIT_DRUMS = {
+  kick: [31], tomLo: [43], floor: [38], tomMid: [48], tomHi: [53], snare: [62],
+  hat: [88, 'tick'], hatPedal: [84, 'tick'], hatOpen: [84, 0.3], crash: [76, 1.2], ride: [91],
+};
+function playDrum(name, hitAbs, vel) {
+  if (!soundOn || !actx) return;
+  const t = actx.currentTime + Math.max(0, hitAbs - nowSec()), kit = activeKit(), m = KIT_DRUMS[name];
+  if (!kit || SOUND.keepDrums || !m) { VOICES.drums(name)(t, vel); return; }
+  if (typeof m[1] === 'number' && kit.scrapes.length) kitScrape(kit, pickTake(kit.scrapes, m[0]), m[0], t, vel, m[1]);
+  else kitHit(kit, pickTake(kit.hits.length ? kit.hits : kit.scrapes, m[0]), m[0], t, vel, rnd(-0.6, 0.6), m[1] === 'tick');
 }
 
 // ---------- instrument kinds ----------
@@ -1111,7 +1394,7 @@ function makeRoute(st, p, base, target, normal) {
   p.inst.t0 = -10; p.inst.amp = 0; p.inst.holdUntil = -10;
   maxTau = Math.max(maxTau, tau);
   const kind = st.spec.kind, key = p.key;
-  const play = typeof key === 'number' ? (h, v, d) => playNote(kind, key, h, v, d) : (h, v) => playVoice(VOICES.drums(key), h, v);
+  const play = typeof key === 'number' ? (h, v, d) => playNote(kind, key, h, v, d) : (h, v) => playDrum(key, h, v);
   const color = typeof key === 'number' ? pitchColor(key) : new THREE.Color(DRUM_LIGHT[key] || 0xffffff);
   return { st, inst: p.inst, play, color, jitter: p.jitter, restitution: p.restitution, target, normal, mouth, dir, tau, tube, rest: tube.position.clone(), fired: -10, ballMat: ballMats[kind] };
 }
@@ -1544,10 +1827,6 @@ function danceStations() {
 // ---------- machines ----------
 // A machine is one rig the song can play on. All of them share the MIDI engine; each decides
 // how far ahead it needs a note (lead), what it does with one (schedule) and how it draws.
-function playVoice(fn, hitAbs, vel) {
-  if (!soundOn || !actx) return;
-  fn(actx.currentTime + Math.max(0, hitAbs - nowSec()), vel);
-}
 
 const pipeMachine = {
   id: 'pipe', label: 'Pipe Rig', blurb: 'Each note fires a ball early enough to land exactly on the beat. Drag to orbit, scroll to zoom.',
@@ -1961,7 +2240,7 @@ const runs = {};
 function drumHit(piece, t, vel) {
   const voice = piece;
   const vis = piece === 'hatOpen' || piece === 'hatPedal' ? 'hat' : piece;
-  playVoice(VOICES.drums(voice), t, vel);
+  playDrum(voice, t, vel);
   const ph = { t, piece: vis, vel, hand: null };
   pieceHits.push(ph);
   if (piece === 'kick') { limbs.RF.strokes.push({ t, piece, vel }); return; }
@@ -2765,6 +3044,122 @@ function toggleFx(k) {
   setStatus(`${label} ${FX[k] ? 'on' : 'off'}. ${tip}.` + (k === 'glow' && !composer ? ' The glow add-on did not load, so this has no effect.' : ''));
 }
 renderFx();
+// sound source: instrument sounds, the generated sword kit, or your own takes (kept in this browser)
+function saveSound() { try { localStorage.setItem('pipeRig.sound', JSON.stringify(SOUND)); } catch { /* still applies now */ } }
+function openTakeDb() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open('pipeRig', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('takes', { keyPath: 'id' });
+    r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+  });
+}
+async function saveTakes() {
+  try {
+    const db = await openTakeDb(), store = db.transaction('takes', 'readwrite').objectStore('takes');
+    store.clear();
+    kits.mine.takes.forEach((c, id) => store.put({ id, name: c.name, type: c.type, midi: c.midi, sr: c.buffer.sampleRate, data: c.buffer.getChannelData(0) }));
+  } catch { /* they last until the page is closed */ }
+}
+async function loadTakes() {
+  try {
+    const db = await openTakeDb(), rows = await new Promise((res, rej) => {
+      const r = db.transaction('takes').objectStore('takes').getAll();
+      r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+    });
+    kits.mine.takes = rows.sort((a, b) => a.id - b.id).map(r => {
+      const buffer = monoBuffer(r.data.length, r.sr);
+      buffer.copyToChannel(r.data, 0);
+      return { buffer, type: r.type, midi: r.midi, name: r.name };
+    });
+    sortTakes(kits.mine);
+    renderSound();
+  } catch { /* nothing saved */ }
+}
+function prepareKit() {
+  if (SOUND.source !== 'swords' || kits.swords.takes.length) return;
+  setTimeout(() => { buildSwords(); renderSound(); }, 0);
+}
+function kitSummary(kit) {
+  return `${kit.hits.length} hit${kit.hits.length === 1 ? '' : 's'} and ${kit.scrapes.length} scrape${kit.scrapes.length === 1 ? '' : 's'}`;
+}
+function renderSound() {
+  const sel = $('#soundSel');
+  if (!sel.options.length) for (const [id, label] of SOUND_SOURCES) sel.add(new Option(label, id));
+  sel.value = SOUND.source;
+  $('#keepDrums').checked = SOUND.keepDrums;
+  $('#kitTools').hidden = SOUND.source !== 'mine';
+  const box = $('#kitTakes');
+  box.innerHTML = '';
+  box.hidden = SOUND.source !== 'mine' || !kits.mine.takes.length;
+  kits.mine.takes.forEach((c, i) => {
+    const el = document.createElement('span'), pitch = c.midi == null ? 'no pitch' : noteName(Math.round(c.midi));
+    el.className = 'take';
+    el.innerHTML = '<button class="tplay" title="Hear this take at middle C">▶</button><button class="ttype"></button><span class="tmeta"></span><button class="tdel" title="Remove this take">×</button>';
+    el.querySelector('.ttype').textContent = c.type === 'hit' ? 'Hit' : 'Scrape';
+    el.querySelector('.ttype').title = 'Switch between hit (short notes) and scrape (held notes)';
+    el.querySelector('.tmeta').textContent = `${pitch} · ${c.buffer.duration.toFixed(1)}s`;
+    el.querySelector('.tplay').onclick = () => previewTake(c);
+    el.querySelector('.ttype').onclick = () => { c.type = c.type === 'hit' ? 'scrape' : 'hit'; sortTakes(kits.mine); saveTakes(); renderSound(); };
+    el.querySelector('.tdel').onclick = () => { kits.mine.takes.splice(i, 1); sortTakes(kits.mine); saveTakes(); renderSound(); };
+    box.appendChild(el);
+  });
+}
+function previewTake(c) {
+  ensureAudio(); soundOn = true; syncSound();
+  const t = actx.currentTime + 0.05;
+  if (c.type === 'hit') kitHit(kits.mine, c, 60, t, 0.8, 0, true);
+  else kitScrape(kits.mine, c, 60, t, 0.8, Math.min(1.5, c.buffer.duration), 0);
+}
+function soundStatus() {
+  const kit = kits[SOUND.source];
+  if (SOUND.source === 'instruments') return 'Instrument sounds: each part plays its own instrument.';
+  const drums = SOUND.keepDrums ? ' Drums stay drums.' : ' The drums play on it too.';
+  if (SOUND.source === 'swords') return `Clanking swords: every part plays on ${kitSummary(kit)}, generated here. Short notes clank, held notes scrape (needs Held notes on).` + drums;
+  if (!kit.takes.length) return 'My sounds: add audio files or press Record and clank, scrape, tap or sing, leaving a short gap between sounds; each becomes its own take. Until then the instruments play.';
+  return `My sounds: every part plays on your ${kitSummary(kit)}. Click Hit or Scrape on a take to switch it.` + drums;
+}
+$('#soundSel').onchange = e => {
+  SOUND.source = e.target.value; saveSound();
+  if (actx) prepareKit();
+  renderSound(); setStatus(soundStatus());
+};
+$('#keepDrums').onchange = e => { SOUND.keepDrums = e.target.checked; saveSound(); setStatus(soundStatus()); };
+async function addSoundFiles(files) {
+  ensureAudio();
+  let added = 0, failed = 0;
+  for (const f of files) {
+    try {
+      const audio = await actx.decodeAudioData(await f.arrayBuffer());
+      const takes = analyzeRecording(audio, f.name.replace(/\.[^.]+$/, ''));
+      kits.mine.takes.push(...takes); added += takes.length;
+    } catch { failed++; }
+  }
+  sortTakes(kits.mine); saveTakes(); renderSound();
+  setStatus((added ? `Added ${added} take${added === 1 ? '' : 's'}. ` : 'No sound was found in that. ') + (failed ? `${failed} file${failed === 1 ? '' : 's'} could not be read as audio. ` : '') + soundStatus());
+}
+$('#kitIn').onchange = e => { addSoundFiles([...e.target.files]); e.target.value = ''; };
+$('#kitClear').onclick = () => { kits.mine.takes = []; sortTakes(kits.mine); saveTakes(); renderSound(); setStatus(soundStatus()); };
+let recorder = null;
+$('#kitRec').onclick = async () => {
+  if (recorder) { recorder.stop(); return; }
+  if (!navigator.mediaDevices || !window.MediaRecorder) { setStatus('Recording is not available in this browser. Add audio files instead.'); return; }
+  let stream;
+  try { stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } }); }
+  catch (err) { setStatus(`The microphone could not be opened (${err.message}). Add audio files instead.`); return; }
+  const chunks = [], rec = recorder = new MediaRecorder(stream), btn = $('#kitRec');
+  rec.ondataavailable = e => chunks.push(e.data);
+  rec.onstop = () => {
+    stream.getTracks().forEach(tr => tr.stop());
+    recorder = null; btn.textContent = 'Record'; btn.classList.remove('rec');
+    addSoundFiles([new File(chunks, 'recording', { type: rec.mimeType })]);
+  };
+  rec.start();
+  btn.textContent = 'Stop recording'; btn.classList.add('rec');
+  setStatus('Recording (up to 20 s). Clank, scrape, tap or sing, with a short gap between sounds; press Stop recording when done.', true);
+  setTimeout(() => { if (recorder === rec) rec.stop(); }, 20000);
+};
+renderSound();
+loadTakes();
 // stage light scales every stage lamp on both machines; glow strength scales the bloom
 const STAGE_LIGHTS = [[pipeHemi, 0.35], [sun, 0.8], [core, 0.6], [dollHemi, 0.3], [rimPink, 1.3], [rimWhite, 0.8], [fill, 0.35]];
 // ---------- environments: Poly Haven HDRIs (CC0) that light and reflect on either machine ----------

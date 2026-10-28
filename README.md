@@ -33,6 +33,12 @@ You can also open the page any other way and drag `.mid` files onto it. Sampled 
   - **Groove**: everything moves with the beat (from the MIDI tempo map). The doll dances in styles picked from how busy the music is (chill sway, nod, headbang, shoulder shimmy, off-beat weirdness); Pipe Rig stations bob, tall ones sway, and a wave sometimes travels around the ring. Every note varies a little: ball arcs, landing spots and bounces, and the doll's stroke height, angle and spot, with runs of repeats rising and falling like real accents
   - **Stage light**, **Glow strength** and **Groove amount** dials
   - **Environment**: light and reflect either machine with a Poly Haven HDRI (soft studio, neon studio, moonlit trees, Venice sunset, warehouse); **Show as backdrop** puts it behind the stage
+- **Sound** — what every part plays on:
+  - **Instrument sounds**: each part's own instrument (samples or synth)
+  - **Clanking swords**: a kit generated in the page from large blades: clanks struck together and stick-slip scrapes
+  - **My sounds**: add audio files or press **Record** and clank, scrape, tap or sing into the microphone, with a short gap between sounds. Each sound becomes its own take: trimmed, levelled, sorted into a hit (it dies away) or a scrape (it keeps going), and checked for pitch. Click a take's Hit/Scrape button to switch it. Takes are kept in this browser.
+  - Short notes trigger hits and held notes trigger scrapes that slide into pitch and last the note (with **Held notes** on). Pitched takes are re-pitched to the note; unpitched clatter strikes a body tuned to the note, so it still carries the melody. Every note varies: a different take than the last, a few cents of detune, brightness from velocity, its own stereo spot, and now and then a flam, a wobbling blade, a settling rattle, a squeal mid-scrape or a shing as a scrape ends.
+  - **Keep drums as drums**: off, the drum parts play on the kit too (low thuds for kick and toms, ticks for hats, scrapes for cymbals).
 - **Parts** — remap any MIDI part to a different instrument, or add a new one.
 - **Live** — a MIDI device or the keyboard (`A`–`;` marimba, `Z`–`M` bass, `1`–`8` drums), in delayed (full arcs) or instant mode.
 
