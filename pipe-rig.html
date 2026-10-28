@@ -89,6 +89,8 @@ select:focus-visible { outline: 2px solid var(--copper-hi); outline-offset: 1px;
 .partbar button { padding: 4px 10px; font-size: 0.78rem; }
 body[data-machine="doll"] .hud p, body[data-machine="doll"] .telemetry, body[data-machine="doll"] .telemetry span b { color: #7a2350; }
 body[data-machine="doll"] .hud h1 { color: #d81b72; }
+.dial { display: inline-flex; align-items: center; gap: 8px; font-size: 0.8rem; color: var(--muted); }
+.dial input { width: 110px; accent-color: var(--copper); }
 .showpanel { position: fixed; bottom: calc(env(safe-area-inset-bottom, 0px) + 14px); left: max(16px, env(safe-area-inset-left, 0px)); background: var(--panel); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); }
 body.dropping #stage { outline: 3px dashed var(--copper); outline-offset: -12px; }
 @media (max-width: 560px) {
@@ -148,6 +150,8 @@ body.dropping #stage { outline: 3px dashed var(--copper); outline-offset: -12px;
   <div class="row" id="fxRow">
     <span class="label">Effects</span>
     <span class="chips" id="fxChips" role="group" aria-label="Visual and sound effects"></span>
+    <label class="dial" for="lightAmt">Stage light <input id="lightAmt" type="range" min="0.3" max="1.6" step="0.05"></label>
+    <label class="dial" for="glowAmt">Glow strength <input id="glowAmt" type="range" min="0" max="2" step="0.05"></label>
   </div>
   <div class="row">
     <span class="label">Live</span>
@@ -196,6 +200,12 @@ const FX_INFO = [
   ['director', 'Auto camera', 'The camera follows the busiest instrument; drag or scroll to take over for a while'],
 ];
 const FX = Object.fromEntries(FX_INFO.map(([k]) => [k, true]));
+// two dials beside the switches: overall stage lighting and how strongly lit-up things glow
+const LEVELS = { light: 1, glow: 1 };
+try {
+  const saved = JSON.parse(localStorage.getItem('pipeRig.levels'));
+  if (saved) for (const k in LEVELS) if (typeof saved[k] === 'number') LEVELS[k] = saved[k];
+} catch { /* defaults */ }
 try {
   const saved = JSON.parse(localStorage.getItem('pipeRig.fx'));
   if (saved) for (const k in FX) if (typeof saved[k] === 'boolean') FX[k] = saved[k];
@@ -227,17 +237,18 @@ function resize() {
 }
 addEventListener('resize', resize);
 
-pipeWorld.add(new THREE.HemisphereLight(0xa9bddf, 0x1c1610, 0.65));
-const sun = new THREE.DirectionalLight(0xfff0dc, 1.15);
+const pipeHemi = new THREE.HemisphereLight(0xa9bddf, 0x1c1610, 0.35);
+pipeWorld.add(pipeHemi);
+const sun = new THREE.DirectionalLight(0xfff0dc, 0.8);
 sun.position.set(6, 22, 12);
 sun.castShadow = true;
 sun.shadow.mapSize.set(2048, 2048);
 pipeWorld.add(sun);
-const core = new THREE.PointLight(0xffb070, 0.9, 16);
+const core = new THREE.PointLight(0xffb070, 0.6, 16);
 core.position.set(0, 5, 0);
 pipeWorld.add(core);
 
-const ground = new THREE.Mesh(new THREE.PlaneGeometry(200, 200), new THREE.MeshStandardMaterial({ color: 0x131925, roughness: 0.92 }));
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(200, 200), new THREE.MeshStandardMaterial({ color: 0x0c1018, roughness: 1 }));
 ground.rotation.x = -Math.PI / 2;
 ground.receiveShadow = true;
 pipeWorld.add(ground);
@@ -255,11 +266,11 @@ for (let i = 0; i < 6; i++) {
 }
 let hitLightIdx = 0;
 const pitchColor = n => new THREE.Color().setHSL((n % 12) / 12, 0.8, 0.6);
-function flashAt(pos, color, vel, reach = 6, fade = 9) {
+function flashAt(pos, color, vel, reach = 6, fade = 9, gain = 1) {
   if (!FX.lights) return;
   const l = hitLights[hitLightIdx++ % hitLights.length];
   l.position.copy(pos); l.color.copy(color); l.distance = reach;
-  Object.assign(l.userData, { t0: nowSec(), peak: 0.6 + 1.8 * vel, k: fade });
+  Object.assign(l.userData, { t0: nowSec(), peak: (0.6 + 1.8 * vel) * gain, k: fade });
 }
 function updateHitLights(now) {
   for (const l of hitLights) {
@@ -277,7 +288,19 @@ if (THREE.EffectComposer && THREE.RenderPass && THREE.UnrealBloomPass && THREE.S
   composer.addPass(bloomPass);
   composer.addPass(new THREE.ShaderPass(THREE.GammaCorrectionShader));   // the render targets are linear
 }
-function setBloom(strength, radius, threshold) { if (bloomPass) Object.assign(bloomPass, { strength, radius, threshold }); }
+let bloomBase = { strength: 0.6, radius: 0.4, threshold: 1 };
+function setBloom(strength, radius, threshold) {
+  bloomBase = { strength, radius, threshold };
+  if (bloomPass) Object.assign(bloomPass, { strength: strength * LEVELS.glow, radius, threshold });
+}
+// the glow pass works in linear color, so the sky color is converted on the way in to keep it as dark as designed
+const linBg = new THREE.Color();
+function renderGlow() {
+  const bg = scene.background;
+  if (bg && bg.isColor) scene.background = linBg.copy(bg).convertSRGBToLinear();
+  composer.render();
+  scene.background = bg;
+}
 
 // ---------- camera orbit ----------
 const orbit = { theta: 0.15, phi: 0.48, r: 22, target: V(0, 1.8, -1) };
@@ -941,7 +964,7 @@ const KINDS = {
           cyl(st.group, d.r, d.r, d.h, shell, x, y + d.h / 2, z, 28);
           if (y > 0) cyl(st.group, 0.04, 0.04, y, frameMat, x, y / 2, z, 8);
           top = y + d.h;
-          const mat = stdMat({ color: 0xe9e3d6, roughness: 0.7, emissive: 0xfff0d0, emissiveIntensity: 0 });
+          const mat = stdMat({ color: 0xbdb6a8, roughness: 0.85, emissive: 0xfff0d0, emissiveIntensity: 0 });
           const head = cyl(st.group, d.r * 0.97, d.r * 0.97, 0.03, mat, x, top + 0.015, z, 28);
           inst = { update(dt, a) { head.position.y = top + 0.015 - a * 0.05 * decay(dt, 10) * Math.abs(Math.sin(50 * dt)); mat.emissiveIntensity = a * 0.6 * decay(dt, 8); } };
         } else {
@@ -962,7 +985,7 @@ const KINDS = {
 };
 const KIND_ORDER = ['bass', 'harp', 'springs', 'marimba', 'xylo', 'vibes', 'bells', 'horns', 'organ', 'laser', 'glock', 'drums'];
 const ballMats = {};
-for (const k in KINDS) ballMats[k] = shared(stdMat({ color: KINDS[k].ball, metalness: 0.5, roughness: 0.28 }));
+for (const k in KINDS) ballMats[k] = shared(stdMat({ color: KINDS[k].ball, metalness: 0.3, roughness: 0.45 }));
 
 // ---------- stations: instrument modules laid out around the launcher ----------
 // They stand in one full circle around the launcher, evenly spaced; the circle grows
@@ -1445,7 +1468,7 @@ function playVoice(fn, hitAbs, vel) {
 const pipeMachine = {
   id: 'pipe', label: 'Pipe Rig', blurb: 'Each note fires a ball early enough to land exactly on the beat. Drag to orbit, scroll to zoom.',
   lead: () => Math.max(maxTau, selfLead) + 0.15,
-  enter() { pipeWorld.visible = true; scene.background = PIPE_BG; scene.fog = PIPE_FOG; scene.environment = null; setBloom(0.9, 0.5, 0.72); },
+  enter() { pipeWorld.visible = true; scene.background = PIPE_BG; scene.fog = PIPE_FOG; scene.environment = null; setBloom(0.6, 0.4, 0.95); },
   exit() { clearLayout(); pipeWorld.visible = false; },
   load(entry) {
     if (entry.kindsSig !== kindsSig()) assignParts(entry);   // instrument toggles changed since this song was set up
@@ -1646,7 +1669,8 @@ for (let i = 0; i < 36; i++) {
   b.position.set(Math.cos(a) * 1.6, RISER_H * 0.5, Math.sin(a) * 1.6); dollWorld.add(b);
 }
 
-dollWorld.add(new THREE.HemisphereLight(0xfff0f6, 0xd8679c, 0.3));
+const dollHemi = new THREE.HemisphereLight(0xfff0f6, 0xd8679c, 0.3);
+dollWorld.add(dollHemi);
 const key = new THREE.SpotLight(0xffffff, 1.1, 0, 0.55, 0.65, 1);
 key.position.set(2.4, 4.6, 3.6); key.target = dollRoot;
 key.castShadow = true; key.shadow.mapSize.set(2048, 2048); key.shadow.bias = -0.0004; key.shadow.radius = 4;
@@ -1991,16 +2015,16 @@ function updateDoll(now, dt) {
     const h = pieceHits.shift(), st = pieceState[h.piece];
     if (st) { st.t0 = h.t; st.amp = 0.35 + 0.65 * h.vel; }
     dollHits++;
-    flashAt(dollRoot.localToWorld(piecePoint(h.piece)), DOLL_LIGHT[h.piece] || DOLL_LIGHT.hat, h.vel, 1.8, 10);
+    flashAt(dollRoot.localToWorld(piecePoint(h.piece)), DOLL_LIGHT[h.piece] || DOLL_LIGHT.hat, h.vel, 1.8, 10, 0.4);
     dollHeat += h.vel;
     if (h.piece === 'kick') kickPulse = { t0: h.t, amp: h.vel };
-    if (h.piece === 'crash') key.intensity = 1.8;
+    if (h.piece === 'crash') key.intensity = 1.8 * LEVELS.light;
     // each hit nudges the body's springs: kicks drive the head and torso, hand strokes rock toward their side
     const [n, l] = BODY_KICK[h.piece] || [0.1, 0];
     body.nod.v += n * h.vel; body.lean.v += l * h.vel;
     if (h.hand) body.roll.v += (h.hand === 'L' ? 1 : -1) * 0.3 * h.vel;
   }
-  key.intensity += (1.1 - key.intensity) * Math.min(1, dt * 4);
+  key.intensity += (1.1 * LEVELS.light - key.intensity) * Math.min(1, dt * 4);
   dollHeat *= Math.exp(-dt * 0.8);
   for (const k in limbs) limbs[k].strokes = limbs[k].strokes.filter(s => s.t > now - 1.5);
 
@@ -2309,7 +2333,7 @@ const dollMachine = {
   id: 'doll', label: 'Doll Drummer', blurb: 'Every stick winds up ahead of its note so it lands exactly on the beat. Drag to orbit, scroll to zoom.',
   lead: () => 0.5,
   enter() {
-    dollWorld.visible = true; scene.background = DOLL_BG; scene.fog = null; scene.environment = studioEnv; setBloom(0.35, 0.3, 0.97);
+    dollWorld.visible = true; scene.background = DOLL_BG; scene.fog = null; scene.environment = studioEnv; setBloom(0.25, 0.3, 2.0);
     resetLimbs();
     Object.assign(orbit, { theta: 0.42, phi: 0.16, r: 3.0 }); orbit.target.set(0, 0.92, 0.25);
   },
@@ -2628,6 +2652,24 @@ function toggleFx(k) {
   setStatus(`${label} ${FX[k] ? 'on' : 'off'}. ${tip}.` + (k === 'glow' && !composer ? ' The glow add-on did not load, so this has no effect.' : ''));
 }
 renderFx();
+// stage light scales every stage lamp on both machines; glow strength scales the bloom
+const STAGE_LIGHTS = [[pipeHemi, 0.35], [sun, 0.8], [core, 0.6], [dollHemi, 0.3], [rimPink, 1.3], [rimWhite, 0.8], [fill, 0.35]];
+function applyLevels() {
+  for (const [l, base] of STAGE_LIGHTS) l.intensity = base * LEVELS.light;
+  key.intensity = 1.1 * LEVELS.light;
+  setBloom(bloomBase.strength, bloomBase.radius, bloomBase.threshold);
+}
+for (const [id, k, label] of [['#lightAmt', 'light', 'Stage light'], ['#glowAmt', 'glow', 'Glow strength']]) {
+  const el = $(id);
+  el.value = LEVELS[k];
+  el.oninput = () => {
+    LEVELS[k] = +el.value;
+    try { localStorage.setItem('pipeRig.levels', JSON.stringify(LEVELS)); } catch { /* still applies now */ }
+    applyLevels();
+    setStatus(label + ' ' + Math.round(LEVELS[k] * 100) + '%.');
+  };
+}
+applyLevels();
 
 $('#dollIn').addEventListener('change', e => { loadDollFiles(e.target.files); e.target.value = ''; });
 $('#dollReset').onclick = () => { removeCustom(); $('#dollReset').hidden = true; $('#dollStatus').textContent = 'Back to the built-in doll.'; };
@@ -2703,7 +2745,7 @@ function frame() {
   if (!directCamera(now, dt) && !reduceMotion && !drag && now - lastTouch > 5) orbit.theta += dt * 0.03;
   placeCam();
   if (machine.beforeRender) machine.beforeRender();
-  if (FX.glow && composer) composer.render(); else renderer.render(scene, camera);
+  if (FX.glow && composer) renderGlow(); else renderer.render(scene, camera);
   if (now - hudT > 0.15) {
     hudT = now;
     $('#tClock').textContent = song ? fmt(now - song.start) + ' / ' + fmt(song.dur) : '—';
