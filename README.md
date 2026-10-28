@@ -52,7 +52,7 @@ Pipe Rig launches each ball at `T − τ` with `v₀ = (P − L)/τ − ½gτ`, 
 
 ## Credits
 
-- [three.js](https://threejs.org) r128 (MIT), plus its GLTFLoader and post-processing examples
+- [three.js](https://threejs.org) r170 (MIT), plus its GLTFLoader, RGBELoader and post-processing add-ons
 - [JSZip](https://stuk.github.io/jszip/) (MIT)
 - HDRI environments in `assets/hdri/`: [Poly Haven](https://polyhaven.com) (CC0)
 - Instrument samples: FluidR3 GM by Frank Wen, rendered by [gleitz/midi-js-soundfonts](https://github.com/gleitz/midi-js-soundfonts), [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/)

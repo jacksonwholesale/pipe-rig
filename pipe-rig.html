@@ -192,18 +192,28 @@ body.dropping #stage { outline: 3px dashed var(--copper); outline-offset: -12px;
   <div class="formula">launch at <em>T − τ</em> · v₀ = <em>(P − L)/τ − ½gτ</em> · bounce v = v − (1+e)(v·n)n</div>
 </div>
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/RGBELoader.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/CopyShader.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/LuminosityHighPassShader.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/GammaCorrectionShader.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/EffectComposer.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/RenderPass.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/ShaderPass.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/UnrealBloomPass.js"></script>
-<script>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+<script type="module">
+// three.js and the add-ons the page uses, gathered into one THREE namespace for the main script below
+import * as CORE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+window.THREE = Object.assign({}, CORE, { GLTFLoader, RGBELoader, EffectComposer, RenderPass, ShaderPass, UnrealBloomPass, OutputPass });
+// colors in this page were chosen as the values the shaders use, so they aren't converted from sRGB
+CORE.ColorManagement.enabled = false;
+</script>
+<script type="module">
 (() => {
 const $ = s => document.querySelector(s);
 const nowSec = () => performance.now() / 1000;
@@ -239,7 +249,9 @@ const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-renderer.outputEncoding = THREE.sRGBEncoding;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+// light intensities below are in the old artist units; three.js now uses physical units, which are π times larger
+const LI = Math.PI;
 
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 300);
@@ -259,14 +271,14 @@ function resize() {
 }
 addEventListener('resize', resize);
 
-const pipeHemi = new THREE.HemisphereLight(0xa9bddf, 0x1c1610, 0.35);
+const pipeHemi = new THREE.HemisphereLight(0xa9bddf, 0x1c1610, 0.35 * LI);
 pipeWorld.add(pipeHemi);
-const sun = new THREE.DirectionalLight(0xfff0dc, 0.8);
+const sun = new THREE.DirectionalLight(0xfff0dc, 0.8 * LI);
 sun.position.set(6, 22, 12);
 sun.castShadow = true;
 sun.shadow.mapSize.set(2048, 2048);
 pipeWorld.add(sun);
-const core = new THREE.PointLight(0xffb070, 0.6, 16);
+const core = new THREE.PointLight(0xffb070, 0.6 * LI, 16, 0);
 core.position.set(0, 5, 0);
 pipeWorld.add(core);
 
@@ -282,7 +294,7 @@ pipeWorld.add(ring);
 // ---------- hit lights: a small pool of point lights, each lent to the latest hit ----------
 const hitLights = [];
 for (let i = 0; i < 6; i++) {
-  const l = new THREE.PointLight(0xffffff, 0, 6, 2);
+  const l = new THREE.PointLight(0xffffff, 0, 6, 0);
   Object.assign(l.userData, { t0: -10, peak: 0, k: 9 });
   scene.add(l); hitLights.push(l);
 }
@@ -297,18 +309,18 @@ function flashAt(pos, color, vel, reach = 6, fade = 9, gain = 1) {
 function updateHitLights(now) {
   for (const l of hitLights) {
     const d = now - l.userData.t0;
-    l.intensity = FX.lights && d >= 0 && d < 2 ? l.userData.peak * Math.exp(-d * l.userData.k) : 0;
+    l.intensity = FX.lights && d >= 0 && d < 2 ? 0.5 * LI * l.userData.peak * Math.exp(-d * l.userData.k) : 0;
   }
 }
 
 // ---------- glow: bloom post-processing; without the add-on scripts the page renders plainly ----------
 let composer = null, bloomPass = null;
-if (THREE.EffectComposer && THREE.RenderPass && THREE.UnrealBloomPass && THREE.ShaderPass && THREE.GammaCorrectionShader) {
+if (THREE.EffectComposer && THREE.RenderPass && THREE.UnrealBloomPass && THREE.OutputPass) {
   composer = new THREE.EffectComposer(renderer, new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType }));
   composer.addPass(new THREE.RenderPass(scene, camera));
   bloomPass = new THREE.UnrealBloomPass(new THREE.Vector2(1, 1), 0.9, 0.5, 0.72);
   composer.addPass(bloomPass);
-  composer.addPass(new THREE.ShaderPass(THREE.GammaCorrectionShader));   // the render targets are linear
+  composer.addPass(new THREE.OutputPass());   // the render targets are linear
 }
 let bloomBase = { strength: 0.6, radius: 0.4, threshold: 1 };
 function setBloom(strength, radius, threshold) {
@@ -1337,7 +1349,7 @@ function labelSprite(text) {
   x.fillStyle = 'rgba(15,20,30,0.78)';
   x.beginPath(); x.roundRect ? x.roundRect((512 - w) / 2, 12, w, 72, 14) : x.rect((512 - w) / 2, 12, w, 72); x.fill();
   x.fillStyle = '#f2ae70'; x.textAlign = 'center'; x.textBaseline = 'middle'; x.fillText(text, 256, 50);
-  const tex = new THREE.CanvasTexture(c); tex.encoding = THREE.sRGBEncoding;
+  const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace;
   const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthWrite: false }));
   s.scale.set(3.2, 0.6, 1);
   return s;
@@ -1820,7 +1832,7 @@ function danceStations() {
   if (tower) {
     const s = 1 + g * 0.02 * beatPulse(B, 5) * (0.3 + e);
     tower.column.scale.set(s, 1, s); tower.dome.scale.setScalar(s);
-    core.intensity = 0.6 * LEVELS.light * (1 + g * 0.5 * e * beatPulse(B, 4));
+    core.intensity = 0.6 * LI * LEVELS.light * (1 + g * 0.5 * e * beatPulse(B, 4));
   }
 }
 
@@ -1899,7 +1911,7 @@ function makeStudioEnv() {
   box(620, 200, 50, 80);    // tall strip behind-right
   box(900, 230, 90, 22);    // low wide strip behind
   const tex = new THREE.CanvasTexture(c);
-  tex.encoding = THREE.sRGBEncoding;
+  tex.colorSpace = THREE.SRGBColorSpace;
   tex.mapping = THREE.EquirectangularReflectionMapping;
   const pm = new THREE.PMREMGenerator(renderer);
   const env = pm.fromEquirectangular(tex).texture;
@@ -1912,7 +1924,7 @@ function canvasTex(w, h, draw, repeat) {
   const c = document.createElement('canvas'); c.width = w; c.height = h;
   draw(c.getContext('2d'), w, h);
   const t = new THREE.CanvasTexture(c);
-  t.encoding = THREE.sRGBEncoding;
+  t.colorSpace = THREE.SRGBColorSpace;
   t.anisotropy = 4;
   if (repeat) { t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(repeat[0], repeat[1]); }
   return t;
@@ -2032,15 +2044,15 @@ for (let i = 0; i < 36; i++) {
   b.position.set(Math.cos(a) * 1.6, RISER_H * 0.5, Math.sin(a) * 1.6); dollWorld.add(b);
 }
 
-const dollHemi = new THREE.HemisphereLight(0xfff0f6, 0xd8679c, 0.3);
+const dollHemi = new THREE.HemisphereLight(0xfff0f6, 0xd8679c, 0.3 * LI);
 dollWorld.add(dollHemi);
-const key = new THREE.SpotLight(0xffffff, 1.1, 0, 0.55, 0.65, 1);
+const key = new THREE.SpotLight(0xffffff, 1.1 * LI, 0, 0.55, 0.65, 0);
 key.position.set(2.4, 4.6, 3.6); key.target = dollRoot;
 key.castShadow = true; key.shadow.mapSize.set(2048, 2048); key.shadow.bias = -0.0004; key.shadow.radius = 4;
 dollWorld.add(key);
-const rimPink = new THREE.PointLight(0xff5fae, 1.3, 9); rimPink.position.set(-2.2, 2.6, -2); dollWorld.add(rimPink);
-const rimWhite = new THREE.PointLight(0xffffff, 0.8, 9); rimWhite.position.set(2.2, 2.2, -2.4); dollWorld.add(rimWhite);
-const fill = new THREE.DirectionalLight(0xffd8ea, 0.35); fill.position.set(-3, 2, 4); dollWorld.add(fill);
+const rimPink = new THREE.PointLight(0xff5fae, 0.8 * LI, 9, 0); rimPink.position.set(-2.2, 2.6, -2); dollWorld.add(rimPink);
+const rimWhite = new THREE.PointLight(0xffffff, 0.5 * LI, 9, 0); rimWhite.position.set(2.2, 2.2, -2.4); dollWorld.add(rimWhite);
+const fill = new THREE.DirectionalLight(0xffd8ea, 0.35 * LI); fill.position.set(-3, 2, 4); dollWorld.add(fill);
 
 // ---------- the kit ----------
 const STICK_L = 0.36;
@@ -2396,14 +2408,14 @@ function updateDoll(now, dt) {
     flashAt(dollRoot.localToWorld(piecePoint(h.piece)), DOLL_LIGHT[h.piece] || DOLL_LIGHT.hat, h.vel, 1.8, 10, 0.4);
     dollHeat += h.vel;
     if (h.piece === 'kick') kickPulse = { t0: h.t, amp: h.vel };
-    if (h.piece === 'crash') key.intensity = 1.8 * LEVELS.light;
+    if (h.piece === 'crash') key.intensity = 1.8 * LI * LEVELS.light;
     // each hit nudges the body's springs: kicks drive the head and torso, hand strokes rock toward their side
     grooveHit(h.vel);
     const [n, l] = BODY_KICK[h.piece] || [0.1, 0];
     body.nod.v += n * h.vel; body.lean.v += l * h.vel;
     if (h.hand) body.roll.v += (h.hand === 'L' ? 1 : -1) * 0.3 * h.vel;
   }
-  key.intensity += (1.1 * LEVELS.light - key.intensity) * Math.min(1, dt * 4);
+  key.intensity += (1.1 * LI * LEVELS.light - key.intensity) * Math.min(1, dt * 4);
   dollHeat *= Math.exp(-dt * 0.8);
   for (const k in limbs) limbs[k].strokes = limbs[k].strokes.filter(s => s.t > now - 1.5);
 
@@ -2724,7 +2736,7 @@ const dollMachine = {
   id: 'doll', label: 'Doll Drummer', blurb: 'Every stick winds up ahead of its note so it lands exactly on the beat. Drag to orbit, scroll to zoom.',
   lead: () => 0.5,
   enter() {
-    dollWorld.visible = true; scene.background = DOLL_BG; scene.fog = null; scene.environment = studioEnv; setBloom(0.25, 0.3, 2.0);
+    dollWorld.visible = true; scene.background = DOLL_BG; scene.fog = null; scene.environment = studioEnv; setBloom(0.25, 0.3, 3.5);
     resetLimbs();
     Object.assign(orbit, { theta: 0.42, phi: 0.16, r: 3.0 }); orbit.target.set(0, 0.92, 0.25);
   },
@@ -3161,7 +3173,7 @@ $('#kitRec').onclick = async () => {
 renderSound();
 loadTakes();
 // stage light scales every stage lamp on both machines; glow strength scales the bloom
-const STAGE_LIGHTS = [[pipeHemi, 0.35], [sun, 0.8], [core, 0.6], [dollHemi, 0.3], [rimPink, 1.3], [rimWhite, 0.8], [fill, 0.35]];
+const STAGE_LIGHTS = [[pipeHemi, 0.35], [sun, 0.8], [core, 0.6], [dollHemi, 0.3], [rimPink, 0.8], [rimWhite, 0.5], [fill, 0.35]];
 // ---------- environments: Poly Haven HDRIs (CC0) that light and reflect on either machine ----------
 const ENVS = [
   ['builtin', 'Built-in'],
@@ -3194,7 +3206,7 @@ function loadEnv(name) {
     if (!THREE.RGBELoader) throw new Error('the HDRI loader did not load');
     const d = new THREE.RGBELoader().setDataType(THREE.HalfFloatType).parse(await fetchHdr(name));
     const tex = new THREE.DataTexture(d.data, d.width, d.height, d.format, d.type);
-    Object.assign(tex, { encoding: THREE.LinearEncoding, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, generateMipmaps: false, flipY: true, mapping: THREE.EquirectangularReflectionMapping });
+    Object.assign(tex, { colorSpace: THREE.LinearSRGBColorSpace, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, generateMipmaps: false, flipY: true, mapping: THREE.EquirectangularReflectionMapping });
     tex.needsUpdate = true;
     const pm = new THREE.PMREMGenerator(renderer);
     const env = pm.fromEquirectangular(tex).texture;
@@ -3241,8 +3253,8 @@ function applyEnvironment() {
 }
 
 function applyLevels() {
-  for (const [l, base] of STAGE_LIGHTS) l.intensity = base * LEVELS.light;
-  key.intensity = 1.1 * LEVELS.light;
+  for (const [l, base] of STAGE_LIGHTS) l.intensity = base * LI * LEVELS.light;
+  key.intensity = 1.1 * LI * LEVELS.light;
   setBloom(bloomBase.strength, bloomBase.radius, bloomBase.threshold);
   applyEnvIntensity();
 }
