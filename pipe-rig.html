@@ -130,6 +130,7 @@ body.dropping #stage { outline: 3px dashed var(--copper); outline-offset: -12px;
       <button data-m="doll" aria-pressed="false">Doll Drummer</button>
       <button data-m="squish" aria-pressed="false">Squish</button>
       <button data-m="smokes" aria-pressed="false">Smokes</button>
+      <button data-m="hand" aria-pressed="false">Crawling Hand</button>
     </span>
   </div>
   <div class="row">
@@ -3834,7 +3835,499 @@ function renderSmokeParts(entry) {
   $('#partSummary').textContent = `${entry.parts.length} part${entry.parts.length > 1 ? 's' : ''} on ${packs.length} pack${packs.length === 1 ? '' : 's'}` + (off ? ` · ${off} off (drums sit out)` : '') + ' (click to change)';
 }
 
-const MACHINES = { pipe: pipeMachine, doll: dollMachine, squish: squishMachine, smokes: smokeMachine };
+
+// ---------- crawling hand: a marble hand that walks on its fingertips like a spider ----------
+// The hand is "Hand Sculpture" by re1monsen (CC BY 4.0). It comes unrigged, so it's rigged here: the wrist
+// cut, the fingertips and each finger's centre line are found from the shape of the mesh, a skeleton is
+// placed along them and every vertex is skinned to it. It crawls palm-down on its five fingertips, each
+// finger reaching for the floor with its own little IK solver. Every note is a step: a fingertip lands
+// exactly on the beat, taps out the note and leaves a glowing print.
+const crawlWorld = new THREE.Group();
+crawlWorld.visible = false;
+scene.add(crawlWorld);
+const CRAWL_BG = new THREE.Color(0x15161a);
+const crBackdrop = new THREE.Mesh(new THREE.SphereGeometry(60, 32, 16), new THREE.ShaderMaterial({
+  side: THREE.BackSide, depthWrite: false,
+  vertexShader: `varying vec3 v_dir; void main () { v_dir = normalize(position); gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+  fragmentShader: `varying vec3 v_dir; void main () {
+      vec3 d = normalize(v_dir);
+      vec3 c = mix(vec3(0.06, 0.06, 0.075), vec3(0.2, 0.2, 0.23), smoothstep(-0.1, 0.6, d.y));
+      gl_FragColor = linearToOutputTexel(vec4(pow(c, vec3(2.2)), 1.0));
+    }`,
+}));
+crawlWorld.add(crBackdrop);
+const crFloor = new THREE.Mesh(new THREE.CircleGeometry(40, 96), new THREE.MeshStandardMaterial({ color: 0x141418, roughness: 0.42, metalness: 0 }));
+crFloor.material.userData.envBase = 0.35;
+crFloor.rotation.x = -Math.PI / 2; crFloor.receiveShadow = true;
+crawlWorld.add(crFloor);
+const crHemi = new THREE.HemisphereLight(0xe8ecff, 0x2a2622, 0.4 * LI);
+const crKey = new THREE.SpotLight(0xfff0dc, 2.2 * LI, 0, 0.5, 0.8, 0);
+crKey.position.set(-2, 4.5, 2.5); crKey.castShadow = true;
+crKey.shadow.mapSize.set(2048, 2048); crKey.shadow.radius = 4; crKey.shadow.bias = -0.0003;
+const crRim = new THREE.DirectionalLight(0xbfd2ff, 1.3 * LI);
+crRim.position.set(2, 2.5, -4);
+crawlWorld.add(crHemi, crKey, crKey.target, crRim);
+
+// ---------- the hand: loaded, oriented, rigged ----------
+let handRig = null, handLoading = null;
+const HAND_LEN = 0.55;    // wrist cut to the longest fingertip, in scene units
+function loadHand() {
+  if (handRig) return Promise.resolve(handRig);
+  if (handLoading) return handLoading;
+  const base = 'assets/models/hand_sculpture/';
+  const parse = (text, path) => new Promise((res, rej) => new THREE.GLTFLoader().parse(text, path, res, e => rej(new Error(e && e.message ? e.message : 'the model could not be read'))));
+  return handLoading = (async () => {
+    let gltf;
+    try {
+      const r = await fetch(base + 'scene.gltf');
+      if (!r.ok) throw new Error(String(r.status));
+      gltf = await parse(await r.text(), base);
+    } catch {
+      const r = await fetch(base + 'scene.gltf.json');
+      if (!r.ok) throw new Error('the hand model did not load');
+      gltf = await parse(await r.text(), base);
+    }
+    return handRig = rigHand(gltf.scene);
+  })().catch(err => { handLoading = null; throw err; });
+}
+// one geometry in the model's own upright space, wrist cut at the bottom, sized so the hand is HAND_LEN tall
+function bakeHand(root) {
+  root.updateMatrixWorld(true);
+  const parts = [];
+  root.traverse(o => { if (o.isMesh) parts.push(o); });
+  if (!parts.length) throw new Error('the hand model has no mesh');
+  parts.sort((a, b) => b.geometry.attributes.position.count - a.geometry.attributes.position.count);
+  const src = parts[0], geo = (src.geometry.index ? src.geometry.toNonIndexed() : src.geometry.clone());
+  geo.applyMatrix4(src.matrixWorld);
+  geo.computeBoundingBox();
+  const bb = geo.boundingBox, s = HAND_LEN / (bb.max.y - bb.min.y);
+  // the wrist cut sits at the origin
+  const p = geo.attributes.position;
+  let cx = 0, cz = 0, k = 0;
+  for (let i = 0; i < p.count; i++) if (p.getY(i) < bb.min.y + (bb.max.y - bb.min.y) * 0.03) { cx += p.getX(i); cz += p.getZ(i); k++; }
+  geo.translate(-cx / k, -bb.min.y, -cz / k);
+  geo.scale(s, s, s);
+  geo.computeVertexNormals();
+  return { geo, material: src.material };
+}
+function rigHand(root) {
+  const { geo, material } = bakeHand(root);
+  const pos = geo.attributes.position, N = pos.count;
+  // weld: corners within a hair of each other are one point of the surface (checking neighbouring grid cells,
+  // so two copies of a seam vertex that straddle a cell boundary still meet)
+  const EPS = 2e-4, grid = new Map(), weld = new Int32Array(N), U = [];
+  for (let i = 0; i < N; i++) {
+    const p = V(pos.getX(i), pos.getY(i), pos.getZ(i)), cx = Math.floor(p.x / EPS), cy = Math.floor(p.y / EPS), cz = Math.floor(p.z / EPS);
+    let found = -1;
+    for (let dx = -1; dx <= 1 && found < 0; dx++) for (let dy = -1; dy <= 1 && found < 0; dy++) for (let dz = -1; dz <= 1 && found < 0; dz++) {
+      const cell = grid.get((cx + dx) + ',' + (cy + dy) + ',' + (cz + dz));
+      if (cell) for (const u of cell) if (U[u].distanceTo(p) < EPS) { found = u; break; }
+    }
+    if (found < 0) { found = U.length; U.push(p); const k = cx + ',' + cy + ',' + cz; if (!grid.has(k)) grid.set(k, []); grid.get(k).push(found); }
+    weld[i] = found;
+  }
+  const M = U.length, nbr = Array.from({ length: M }, () => new Set());
+  for (let i = 0; i < N; i += 3) for (let a = 0; a < 3; a++) { const u = weld[i + a], v = weld[i + (a + 1) % 3]; if (u !== v) { nbr[u].add(v); nbr[v].add(u); } }
+  const adj = nbr.map(s => [...s]);
+  let maxY = 0;
+  for (const u of U) maxY = Math.max(maxY, u.y);
+  // distance across the surface from the wrist cut
+  const D = new Float32Array(M).fill(Infinity), heap = [];
+  const push = (d, v) => { heap.push([d, v]); let i = heap.length - 1; while (i > 0) { const p = (i - 1) >> 1; if (heap[p][0] <= heap[i][0]) break; [heap[p], heap[i]] = [heap[i], heap[p]]; i = p; } };
+  const pop = () => { const top = heap[0], last = heap.pop(); if (heap.length) { heap[0] = last; let i = 0; for (;;) { const l = 2 * i + 1, r = l + 1; let m = i; if (l < heap.length && heap[l][0] < heap[m][0]) m = l; if (r < heap.length && heap[r][0] < heap[m][0]) m = r; if (m === i) break; [heap[m], heap[i]] = [heap[i], heap[m]]; i = m; } } return top; };
+  for (let v = 0; v < M; v++) if (U[v].y < maxY * 0.03) { D[v] = 0; push(0, v); }
+  while (heap.length) {
+    const [d, v] = pop();
+    if (d > D[v]) continue;
+    for (const u of adj[v]) { const nd = d + U[v].distanceTo(U[u]); if (nd < D[u]) { D[u] = nd; push(nd, u); } }
+  }
+  // anything still unreached (a stray island) takes its distance from the nearest reached point
+  const reached = [];
+  for (let v = 0; v < M; v++) if (D[v] < Infinity) reached.push(v);
+  for (let v = 0; v < M; v++) if (D[v] === Infinity) { let b = reached[0]; for (const u of reached) if (U[u].distanceTo(U[v]) < U[b].distanceTo(U[v])) b = u; D[v] = D[b] + U[b].distanceTo(U[v]); }
+  let maxD = 0;
+  for (let v = 0; v < M; v++) maxD = Math.max(maxD, D[v]);
+  // fingers are the peaks of that distance that stand well apart: sweep down from the farthest point, joining
+  // regions as they meet; a peak whose region lasts a long way before meeting a taller one is a fingertip
+  const order = [...Array(M).keys()].filter(v => D[v] < Infinity).sort((a, b) => D[b] - D[a]);
+  const par = new Int32Array(M).fill(-1), peakOf = new Int32Array(M).fill(-1), life = new Map();
+  const find = x => { while (par[x] !== x) { par[x] = par[par[x]]; x = par[x]; } return x; };
+  for (const v of order) {
+    par[v] = v; peakOf[v] = v;
+    for (const u of adj[v]) {
+      if (par[u] < 0) continue;
+      const a = find(u), b = find(v);
+      if (a === b) continue;
+      const pa = peakOf[a], pb = peakOf[b], keep = D[pa] >= D[pb] ? pa : pb, lose = keep === pa ? pb : pa;
+      if (!life.has(lose)) life.set(lose, D[lose] - D[v]);
+      par[a] = b; peakOf[b] = keep;
+    }
+  }
+  const top = order[0];
+  life.set(top, Infinity);
+  const tips = [...life.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([v]) => v);
+  if (tips.length < 5 || life.get(tips[4]) < maxD * 0.06) throw new Error('could not find five fingers on this model');
+  // sweep again with only the fingertips owning regions: where two fingers' regions meet is the base of a finger
+  const isTip = new Set(tips), owner = new Map(), baseD = new Map(), label = new Int32Array(M).fill(-1), members = new Map();
+  par.fill(-1);
+  for (const v of order) {
+    par[v] = v; members.set(v, [v]);
+    owner.set(v, isTip.has(v) ? v : -1);
+    for (const u of adj[v]) {
+      if (par[u] < 0) continue;
+      const a = find(u), b = find(v);
+      if (a === b) continue;
+      const oa = owner.get(a), ob = owner.get(b);
+      let o = oa >= 0 ? oa : ob;
+      if (oa >= 0 && ob >= 0 && oa !== ob) {
+        for (const t of [oa, ob]) if (!baseD.has(t)) baseD.set(t, D[v]);
+        o = -2;
+      } else if (oa === -2 || ob === -2) o = -2;
+      // a bump's region joining a finger becomes part of that finger
+      const big = members.get(a).length >= members.get(b).length ? a : b, small = big === a ? b : a;
+      if (o >= 0 && !baseD.has(o)) for (const w of members.get(small).concat(members.get(big))) if (label[w] < 0) label[w] = o;
+      members.set(big, members.get(big).concat(members.get(small))); members.delete(small);
+      par[small] = big; owner.set(big, o);
+    }
+    const o = owner.get(find(v));
+    if (o >= 0 && !baseD.has(o)) label[v] = o;
+  }
+  // each finger's centre line: average position of its surface in bands of distance from the base to the tip
+  const fingers = tips.map(t => {
+    const b = baseD.get(t) ?? D[t] * 0.6, bands = 10, sum = Array.from({ length: bands }, () => [V(0, 0, 0), 0]);
+    for (let v = 0; v < M; v++) if (label[v] === t) { const k = Math.min(bands - 1, Math.floor((D[v] - b) / (D[t] - b) * bands)); sum[k][0].add(U[v]); sum[k][1]++; }
+    const line = sum.filter(([, c]) => c > 0).map(([p, c]) => p.divideScalar(c));
+    line.push(U[t].clone());
+    return { tip: t, base: b, line };
+  });
+  // the thumb branches off lowest
+  fingers.sort((a, b) => a.base - b.base);
+  const thumb = fingers[0];
+  // the others ordered across the hand from the thumb side
+  const rest = fingers.slice(1).sort((a, b) => a.line[0].distanceTo(thumb.line[0]) - b.line[0].distanceTo(thumb.line[0]));
+  const ordered = [thumb, ...rest];   // thumb, index, middle, ring, little
+  // joints: the knuckle sits a little inside the palm, then the bones split the finger in natural proportions
+  const bones = [], wrist = new THREE.Bone();
+  bones.push(wrist);
+  const rig = { fingers: [] };
+  ordered.forEach((f, fi) => {
+    const line = f.line, dir0 = line[0].clone().sub(line[Math.min(1, line.length - 1)]).normalize();
+    const len0 = line.reduce((s, p, i) => (i ? s + p.distanceTo(line[i - 1]) : 0), 0);
+    const knuckle = line[0].clone().addScaledVector(dir0, len0 * (fi === 0 ? 0.45 : 0.22));
+    const pts = [knuckle, ...line], cum = [0];
+    for (let i = 1; i < pts.length; i++) cum.push(cum[i - 1] + pts[i].distanceTo(pts[i - 1]));
+    const L = cum[cum.length - 1];
+    const at = s => { for (let i = 1; i < pts.length; i++) if (cum[i] >= s) return pts[i - 1].clone().lerp(pts[i], (s - cum[i - 1]) / Math.max(1e-6, cum[i] - cum[i - 1])); return pts[pts.length - 1].clone(); };
+    const split = fi === 0 ? [0, 0.42, 0.72, 1] : [0, 0.44, 0.71, 1];
+    const J = split.map(u => at(u * L));
+    // the axis it bends around: from how the sculpted finger already curls, or across the palm if it's straight
+    const a = J[1].clone().sub(J[0]), c = J[3].clone().sub(J[2]);
+    let axis = a.clone().cross(c);
+    if (axis.length() < 1e-4 * L * L) axis = a.clone().cross(V(0, 0, 1));
+    axis.normalize();
+    const chain = J.map(() => new THREE.Bone());
+    chain[0].position.copy(J[0]); wrist.add(chain[0]);
+    for (let i = 1; i < 4; i++) { chain[i].position.copy(J[i]).sub(J[i - 1]); chain[i - 1].add(chain[i]); }
+    const first = bones.length;
+    bones.push(...chain);
+    rig.fingers.push({ name: ['thumb', 'index', 'middle', 'ring', 'little'][fi], tip: f.tip, base: f.base, J, cum: split.map(u => u * L), L, axis, bones: chain, first, curl: 0, vcurl: 0, target: 0 });
+  });
+  // skin: finger surfaces follow their bones with soft blends at the joints; the palm near a knuckle partly follows it
+  const SI = new Uint16Array(N * 4), SW = new Float32Array(N * 4), tmp = V(0, 0, 0);
+  const fingerOf = new Map(rig.fingers.map(f => [f.tip, f]));
+  for (let i = 0; i < N; i++) {
+    const v = weld[i], p = U[v], w = new Map([[0, 0]]);
+    let f = label[v] >= 0 ? fingerOf.get(label[v]) : null, palmShare = 1;
+    if (!f) {
+      // the nearest knuckle pulls on the palm just below a finger
+      f = rig.fingers.reduce((m, g) => (p.distanceTo(g.J[0]) < p.distanceTo(m.J[0]) ? g : m), rig.fingers[0]);
+      const band = maxD * 0.08;
+      palmShare = 1 - clamp((D[v] - (f.base - band)) / band, 0, 1) * 0.6;
+    } else palmShare = 0;
+    // where along the finger this point lies
+    let best = Infinity, s = 0;
+    for (let k = 1; k < 4; k++) {
+      const A = f.J[k - 1], B = f.J[k], ab = tmp.copy(B).sub(A), t = clamp(p.clone().sub(A).dot(ab) / ab.lengthSq(), 0, 1);
+      const d = A.clone().addScaledVector(ab, t).distanceTo(p);
+      if (d < best) { best = d; s = f.cum[k - 1] + t * (f.cum[k] - f.cum[k - 1]); }
+    }
+    const bw = f.L * 0.06, share = 1 - palmShare;
+    const toPip = clamp((s - (f.cum[1] - bw)) / (2 * bw), 0, 1), toDip = clamp((s - (f.cum[2] - bw)) / (2 * bw), 0, 1);
+    w.set(0, palmShare);
+    w.set(f.first, share * (1 - toPip));
+    w.set(f.first + 1, share * toPip * (1 - toDip));
+    w.set(f.first + 2, share * toPip * toDip);
+    const top4 = [...w.entries()].filter(([, x]) => x > 1e-4).sort((a, b) => b[1] - a[1]).slice(0, 4), tot = top4.reduce((t, [, x]) => t + x, 0) || 1;
+    top4.forEach(([bi, x], k) => { SI[i * 4 + k] = bi; SW[i * 4 + k] = x / tot; });
+    if (!top4.length) SW[i * 4] = 1;
+  }
+  geo.setAttribute('skinIndex', new THREE.BufferAttribute(SI, 4));
+  geo.setAttribute('skinWeight', new THREE.BufferAttribute(SW, 4));
+  const mesh = new THREE.SkinnedMesh(geo, material);
+  mesh.castShadow = mesh.receiveShadow = true; mesh.frustumCulled = false;
+  mesh.add(wrist);
+  mesh.updateMatrixWorld(true);
+  mesh.bind(new THREE.Skeleton(bones));
+  // which way the palm faces: the side the fingers curl toward
+  const palm = V(0, 0, 0);
+  for (const f of rig.fingers.slice(1)) palm.add(f.axis.clone().cross(f.J[1].clone().sub(f.J[0])).normalize());
+  palm.normalize();
+  Object.assign(rig, { mesh, wrist, palm, index: rig.fingers[1] });
+  return rig;
+}
+
+
+// ---------- the crawl ----------
+// The body (the palm) is a group that wanders the floor; the hand mesh sits in it palm-down with the fingers
+// forward. Each finger is a leg with a home spot on the floor; when its planted tip lags too far behind
+// home it steps, in alternating groups so the hand always stands on some fingers.
+const crawl = { group: new THREE.Group(), pos: V(0, 0, 0), yaw: 0, speed: 0, goal: V(1, 0, 1), goalUntil: 0, height: 0.1, legs: [], ready: false, lastGroup: -1 };
+crawlWorld.add(crawl.group);
+const CR = { STEP: 0.06, SWING: 0.16, LIFT: 0.05 };
+const crTmp = { a: V(0, 0, 0), b: V(0, 0, 0), c: V(0, 0, 0), q: new THREE.Quaternion(), n: V(0, 0, 0) };
+// knuckles bend least (they carry the palm's skin with them), the middle joints most
+const JOINT_LIMITS = [[-0.3, 0.75], [-0.1, 1.9], [-0.1, 1.5]], THUMB_LIMITS = [[-0.9, 0.9], [-0.9, 1.3], [-0.7, 1.2]];
+// bend one finger so its tip reaches toward a point: cyclic coordinate descent over its three joints,
+// each turning only about its own bending axis
+function reachFinger(f, target, iters = 4) {
+  const tipBone = f.bones[3], lim = f.name === 'thumb' ? THUMB_LIMITS : JOINT_LIMITS;
+  for (let it = 0; it < iters; it++) {
+    for (let k = 2; k >= 0; k--) {
+      const b = f.bones[k];
+      b.parent.updateWorldMatrix(true, true);
+      const jp = b.getWorldPosition(crTmp.a), tp = tipBone.getWorldPosition(crTmp.b);
+      const ax = crTmp.n.copy(f.axis).applyQuaternion(b.parent.getWorldQuaternion(crTmp.q)).normalize();
+      const u = tp.sub(jp), w = crTmp.c.copy(target).sub(jp);
+      u.addScaledVector(ax, -u.dot(ax)); w.addScaledVector(ax, -w.dot(ax));
+      if (u.lengthSq() < 1e-10 || w.lengthSq() < 1e-10) continue;
+      const delta = Math.atan2(ax.dot(u.clone().cross(w)), u.dot(w));
+      f.ang[k] = clamp(f.ang[k] + delta * 0.8, lim[k][0], lim[k][1]);
+      b.quaternion.setFromAxisAngle(f.axis, f.ang[k]);
+    }
+  }
+}
+function setupCrawl(rig) {
+  crawl.group.clear();
+  crawl.group.add(rig.mesh);
+  // palm down, fingers forward (+z), wrist trailing behind and a little up
+  const basis = (d, p) => { const pp = p.clone().addScaledVector(d, -p.dot(d)).normalize(); return new THREE.Matrix4().makeBasis(d, pp, d.clone().cross(pp)); };
+  const src = basis(V(0, 1, 0), rig.palm), dst = basis(V(0, -0.25, 1).normalize(), V(0, -1, -0.25).normalize());
+  rig.mesh.quaternion.setFromRotationMatrix(dst.multiply(src.transpose()));
+  // centre the palm (the average knuckle) over the body's origin
+  const knuckles = rig.fingers.reduce((s, f) => s.add(f.J[0]), V(0, 0, 0)).divideScalar(rig.fingers.length).applyQuaternion(rig.mesh.quaternion);
+  rig.mesh.position.copy(knuckles).negate();
+  crawl.height = Math.max(...rig.fingers.map(f => f.L)) * 0.55;
+  crawl.group.position.set(crawl.pos.x, crawl.height, crawl.pos.z);
+  crawl.group.rotation.set(0, crawl.yaw, 0);
+  crawl.group.updateWorldMatrix(true, true);
+  // each leg's home on the floor: out from its knuckle along the finger, at the distance where it actually
+  // reaches the floor best (a finger only bends in one plane, so some spots are out of its reach)
+  crawl.legs = rig.fingers.map((f, i) => {
+    const reset = () => { f.ang = [0, 0, 0]; for (const b of f.bones.slice(0, 3)) b.quaternion.identity(); };
+    reset();
+    crawl.group.updateWorldMatrix(true, true);
+    const k = f.bones[0].getWorldPosition(V(0, 0, 0)), t = f.bones[3].getWorldPosition(V(0, 0, 0));
+    const dir = t.clone().sub(k).setY(0).normalize();
+    let homeW = k.clone().setY(0), best = Infinity;
+    for (let u = 0.15; u <= 1.01; u += 0.05) {
+      reset();
+      const p = k.clone().addScaledVector(dir, u * f.L).setY(0);
+      reachFinger(f, p, 14);
+      const err = f.bones[3].getWorldPosition(V(0, 0, 0)).distanceTo(p) + 0.02 * Math.abs(u - 0.6);
+      if (err < best) { best = err; homeW = p; }
+    }
+    reset();
+    const home = crawl.group.worldToLocal(homeW.clone());
+    // a finger that can't reach the floor from here stays raised (a pinky held up), twitching in the air
+    return { f, home, planted: homeW.clone(), from: V(0, 0, 0), to: V(0, 0, 0), t0: 0, t1: -1, note: null, group: i === 0 || i === 2 || i === 4 ? 0 : 1, tip: homeW.clone(), free: best > 0.04 };
+  });
+  crawl.ready = true;
+}
+
+// ---------- footprints: a ring of light where a note's fingertip lands ----------
+const printGeo = new THREE.RingGeometry(0.012, 0.03, 32);
+printGeo.rotateX(-Math.PI / 2);
+const prints = [];
+function stampPrint(at, color, vel) {
+  const m = new THREE.Mesh(printGeo, new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.9, blending: THREE.AdditiveBlending, depthWrite: false }));
+  m.position.copy(at).setY(0.002);
+  crawlWorld.add(m);
+  prints.push({ m, t0: nowSec(), vel });
+  if (prints.length > 60) { const p = prints.shift(); crawlWorld.remove(p.m); p.m.material.dispose(); }
+}
+function updatePrints(now) {
+  for (let i = prints.length - 1; i >= 0; i--) {
+    const p = prints[i], age = now - p.t0;
+    if (age > 2.5) { crawlWorld.remove(p.m); p.m.material.dispose(); prints.splice(i, 1); continue; }
+    p.m.scale.setScalar(1 + age * (0.8 + 1.2 * p.vel));
+    p.m.material.opacity = (FX.lights ? 0.9 : 0.4) * Math.pow(1 - age / 2.5, 2);
+  }
+}
+
+// ---------- the sound of a step: a tuned knock of marble on stone ----------
+function marbleTap(midi, t, vel, d, pan) {
+  const f = mtof(midi), len = d != null ? clamp(d + 0.3, 0.35, 2.5) : 0.6, bus = actx.createGain();
+  bus.gain.value = 0.22 * (0.3 + 0.7 * vel);
+  if (actx.createStereoPanner) { const p = actx.createStereoPanner(); p.pan.value = pan; bus.connect(p).connect(master); } else bus.connect(master);
+  for (const [m, a, dec] of [[1, 1, len], [2.0, 0.25, len * 0.5], [3.9, 0.12, 0.12], [6.8, 0.06, 0.05]]) {
+    if (f * m > 16000) continue;
+    const g = env(t, a, dec, 0.002); g.connect(bus); osc(m === 1 ? 'triangle' : 'sine', f * m, t, dec, g);
+  }
+  const hp = filt('bandpass', 3200, 1.2); hp.connect(out(t, 0.1 * vel, 0.025)); noise(t, 0.025, hp);
+}
+
+let crawlHits = 0, crawlNotes = [], crawlPitch = { lo: 48, hi: 84 };
+// which finger plays a pitch: low notes on the little-finger side, high on the thumb side
+const fingerForNote = note => {
+  const u = crawlPitch.hi > crawlPitch.lo ? (note - crawlPitch.lo) / (crawlPitch.hi - crawlPitch.lo) : 0.5;
+  return [4, 3, 2, 1, 0][Math.round(clamp(u, 0, 1) * 4)];
+};
+function updateCrawl(now, dt) {
+  if (!crawl.ready) return;
+  const legs = crawl.legs, energy = Math.min(1, groove.energy * 1.4);
+  // wander: head for a spot on the floor, pick a new one on arrival; busier music walks faster
+  if (crawl.pos.distanceTo(crawl.goal) < 0.25 || now > crawl.goalUntil) {
+    const a = Math.random() * Math.PI * 2, r = 0.4 + Math.random() * 1.8;
+    crawl.goal.set(Math.cos(a) * r, 0, Math.sin(a) * r);
+    crawl.goalUntil = now + 6 + Math.random() * 6;
+  }
+  const to = crTmp.a.copy(crawl.goal).sub(crawl.pos), want = Math.atan2(to.x, to.z);
+  let dy = want - crawl.yaw;
+  dy = Math.atan2(Math.sin(dy), Math.cos(dy));
+  crawl.yaw += clamp(dy, -1, 1) * dt * 1.6;
+  const targetSpeed = (0.12 + 0.28 * energy) * Math.max(0.2, Math.cos(dy));
+  crawl.speed += (targetSpeed - crawl.speed) * Math.min(1, dt * 2);
+  const fwd = V(Math.sin(crawl.yaw), 0, Math.cos(crawl.yaw));
+  crawl.pos.addScaledVector(fwd, crawl.speed * dt);
+  // landings first, so a leg that just came down is planted before anything decides whether it steps again
+  for (const l of legs) if (l.t1 > 0 && now >= l.t1 && !l.landed) land(l, now);
+  // notes claim fingers: each note's finger swings so its tip lands exactly on the note
+  for (const e of crawlNotes) {
+    if (e.leg) continue;
+    let leg = legs[fingerForNote(e.note)];
+    if (leg.free || leg.t1 > now - 0.02 || leg.note) leg = legs.find(l => !l.free && l.t1 < now && !l.note) || legs.find(l => !l.free) || leg;
+    if (now >= e.t - CR.SWING) { e.leg = leg; leg.note = e; startStep(leg, now, e.t); }
+  }
+  crawlNotes = crawlNotes.filter(e => !e.leg || now < e.t + 0.1);
+  // between notes the legs keep up by themselves, quietly, the two groups taking turns
+  const swinging = legs.filter(l => now < l.t1), lagOf = l => crawl.group.localToWorld(crTmp.b.copy(l.home)).setY(0).distanceTo(l.planted);
+  for (const l of legs) {
+    if (l.free || now < l.t1 || l.note || lagOf(l) <= CR.STEP) continue;
+    if (swinging.some(s => s.group !== l.group)) continue;
+    // the group that stepped last waits, unless the other group has nothing to catch up on
+    const others = legs.filter(o => o.group !== l.group && !o.free);
+    if (l.group === crawl.lastGroup && !swinging.length && others.some(o => lagOf(o) > CR.STEP * 0.6)) continue;
+    startStep(l, now, now + CR.SWING); swinging.push(l); crawl.lastGroup = l.group;
+  }
+  // the body: carried along, bobbing as it steps, leaning toward the side that's pushing
+  const bob = Math.sin(now * 9 * (0.5 + crawl.speed * 2)) * 0.006 * Math.min(1, crawl.speed * 6);
+  crawl.group.position.set(crawl.pos.x, crawl.height + bob, crawl.pos.z);
+  crawl.group.rotation.set(0.05 * Math.sin(now * 2.3) * grooveAmt(), crawl.yaw, -dy * 0.15);
+  // legs: swinging ones arc toward their landing; planted ones stay put; every finger reaches its tip
+  for (const l of legs) {
+    if (l.free) {
+      crawl.group.localToWorld(l.tip.copy(l.home)).setY(0.05 + 0.015 * Math.sin(now * 3.1 + l.f.L * 40) + 0.01 * Math.sin(now * 11.3));
+      reachFinger(l.f, l.tip, 2);
+      continue;
+    }
+    if (now < l.t1) {
+      const u = clamp((now - l.t0) / (l.t1 - l.t0), 0, 1), e = u * u * (3 - 2 * u);
+      l.tip.copy(l.from).lerp(l.to, e).setY(Math.sin(u * Math.PI) * CR.LIFT * (l.note ? 1.3 : 1));
+    } else l.tip.copy(l.planted);
+    reachFinger(l.f, l.tip);
+  }
+  crawl.group.updateWorldMatrix(true, true);
+}
+function startStep(l, now, landAt) {
+  const homeW = crawl.group.localToWorld(crTmp.b.copy(l.home)).setY(0);
+  // land a little ahead of home, in the direction the body is going
+  const ahead = V(Math.sin(crawl.yaw), 0, Math.cos(crawl.yaw)).multiplyScalar(crawl.speed * (landAt - now + 0.15));
+  l.from.copy(l.planted); l.to.copy(homeW).add(ahead);
+  l.t0 = now; l.t1 = Math.max(landAt, now + 0.05); l.landed = false;
+}
+function land(l, now) {
+  l.landed = true; l.planted.copy(l.to);
+  const e = l.note;
+  if (!e) return;
+  l.note = null; crawlHits++; grooveHit(e.vel);
+  const c = pitchColor(e.note);
+  stampPrint(l.planted, c, e.vel);
+  flashAt(l.planted.clone().setY(0.05), c, e.vel * 0.6, 1, 7, 0.5);
+}
+
+function defaultCrawlMap(entry) {
+  entry.crawlMap = {};
+  const parts = entry.parts.filter(pt => pt.ch !== 9 && guessKind(pt) !== 'off').sort((a, b) => b.count - a.count);
+  parts.forEach((pt, i) => { entry.crawlMap[pt.key] = i === 0 ? 'hand' : 'off'; });
+  for (const pt of entry.parts) if (!entry.crawlMap[pt.key]) entry.crawlMap[pt.key] = 'off';
+}
+function crawlRange(entry) {
+  const ns = entry.notes.filter(e => entry.crawlMap[e.part] === 'hand').map(e => e.note);
+  crawlPitch = ns.length ? { lo: Math.min(...ns), hi: Math.max(...ns) } : { lo: 48, hi: 84 };
+}
+
+const crawlMachine = {
+  id: 'hand', label: 'Crawling Hand', blurb: 'A marble hand crawls the floor on its fingertips. Every note is a step that lands right on the beat. Drag to orbit, scroll to zoom.',
+  lead: () => 0.4,
+  stage: () => ({ env: squishEnv, bg: CRAWL_BG, fog: null, backdrop: crBackdrop }),
+  enter() {
+    crawlWorld.visible = true; scene.background = CRAWL_BG; scene.fog = null; scene.environment = squishEnv; setBloom(0.5, 0.45, 1.2);
+    Object.assign(orbit, { theta: 0.6, phi: 0.4, r: 1.8 }); orbit.target.set(crawl.pos.x, 0.1, crawl.pos.z);
+    loadHand().then(rig => { if (!crawl.ready) setupCrawl(rig); setStatus('The hand is rigged: ' + rig.fingers.map(f => f.name).join(', ') + ' found. It walks on all five.'); })
+      .catch(err => setStatus(`Couldn't rig the hand: ${err.message}.`));
+  },
+  exit() { crawlWorld.visible = false; scene.environment = null; },
+  load(entry) { if (!entry.crawlMap) defaultCrawlMap(entry); crawlRange(entry); crawlNotes = []; },
+  refresh(entry) { crawlRange(entry); },
+  schedule(e, hitAbs, entry) {
+    if (entry.crawlMap[e.part] !== 'hand') return;
+    const vel = e.vel / 127, d = FX.hold && e.dur ? e.dur : null;
+    crawlNotes.push({ t: hitAbs, note: e.note, vel });
+    if (!soundOn || !actx) return;
+    const t = actx.currentTime + Math.max(0, hitAbs - nowSec());
+    if (!kitPlay(e.note, t, vel, d)) marbleTap(e.note, t, vel, d, clamp(crawl.pos.x / 2, -0.7, 0.7));
+  },
+  live(note, vel) {
+    const t = nowSec() + 0.3;
+    crawlNotes.push({ t, note, vel: vel / 127 });
+    if (soundOn && actx && !kitPlay(note, actx.currentTime + 0.3, vel / 127, null)) marbleTap(note, actx.currentTime + 0.3, vel / 127, null, 0);
+    return true;
+  },
+  update(now, dt) {
+    updateCrawl(now, dt);
+    updatePrints(now);
+    // the camera keeps the hand in view wherever it wanders
+    orbit.target.lerp(crTmp.c.set(crawl.pos.x, 0.12, crawl.pos.z), 1 - Math.exp(-dt * 2));
+    if (director.shot) director.shot.target.set(crawl.pos.x, director.shot.y0 ?? 0.12, crawl.pos.z);
+  },
+  // auto camera: low and close at hand level, from the side, from above, or trailing behind
+  pickShot() {
+    const shots = [
+      { theta: crawl.yaw + 0.9, phi: 0.12, r: 1.1, y0: 0.1, drift: 0.04 },
+      { theta: crawl.yaw + Math.PI / 2, phi: 0.25, r: 1.5, y0: 0.12, drift: 0.02 },
+      { theta: crawl.yaw, phi: 1.1, r: 1.6, y0: 0.05, drift: 0.05 },
+      { theta: crawl.yaw + Math.PI, phi: 0.3, r: 1.3, y0: 0.15, drift: 0.02 },
+      { theta: crawl.yaw + 0.4, phi: 0.05, r: 0.8, y0: 0.08, drift: 0.03 },
+    ];
+    const s = shots[Math.floor(Math.random() * shots.length)];
+    s.target = V(crawl.pos.x, s.y0, crawl.pos.z);
+    return s;
+  },
+  inFlight: () => crawl.legs.filter(l => l.note).length,
+  hits: () => crawlHits,
+};
+function renderCrawlParts(entry) {
+  const list = $('#partList');
+  list.innerHTML = '';
+  entry.parts.forEach((pt, i) => list.appendChild(partRow(pt, i,
+    [['hand', 'The hand steps it'], ['off', 'Off']],
+    entry.crawlMap[pt.key], v => { entry.crawlMap[pt.key] = v; crawlRange(entry); renderCrawlParts(entry); })));
+  $('#parts').hidden = !entry.parts.length;
+  const n = entry.parts.filter(p => entry.crawlMap[p.key] === 'hand').length;
+  $('#partSummary').textContent = `${entry.parts.length} part${entry.parts.length > 1 ? 's' : ''}: ${n} stepped by the hand (click to change)`;
+}
+
+const MACHINES = { pipe: pipeMachine, doll: dollMachine, squish: squishMachine, smokes: smokeMachine, hand: crawlMachine };
 let machine = pipeMachine;
 
 // ---------- transport ----------
@@ -3898,7 +4391,7 @@ function fmt(t) { t = Math.max(0, t); return Math.floor(t / 60) + ':' + String(M
 const NOTE_NAMES = ['C', 'C♯', 'D', 'D♯', 'E', 'F', 'F♯', 'G', 'G♯', 'A', 'A♯', 'B'];
 const noteName = n => NOTE_NAMES[n % 12] + (Math.floor(n / 12) - 1);
 
-function renderParts(entry) { return machine === dollMachine ? renderDollParts(entry) : machine === squishMachine ? renderSquishParts(entry) : machine === smokeMachine ? renderSmokeParts(entry) : renderPipeParts(entry); }
+function renderParts(entry) { return machine === dollMachine ? renderDollParts(entry) : machine === squishMachine ? renderSquishParts(entry) : machine === smokeMachine ? renderSmokeParts(entry) : machine === crawlMachine ? renderCrawlParts(entry) : renderPipeParts(entry); }
 function partRow(pt, i, options, value, onchange) {
   const row = document.createElement('div');
   row.className = 'part';
@@ -4087,6 +4580,7 @@ $('#autoAssign').onclick = () => {
   if (machine === dollMachine) defaultDollMap(current);
   else if (machine === squishMachine) { defaultSquishMap(current); buildBlobs(current); }
   else if (machine === smokeMachine) { defaultSmokeMap(current); buildPacks(current); }
+  else if (machine === crawlMachine) { defaultCrawlMap(current); crawlRange(current); }
   else { current.manual = {}; assignParts(current); buildLayout(current.specs); }
   renderParts(current);
   setStatus(`Every part of ${current.name} is mapped automatically again.`);
@@ -4233,7 +4727,7 @@ $('#kitRec').onclick = async () => {
 renderSound();
 loadTakes();
 // stage light scales every stage lamp on both machines; glow strength scales the bloom
-const STAGE_LIGHTS = [[pipeHemi, 0.35], [sun, 0.8], [core, 0.6], [dollHemi, 0.3], [rimPink, 0.8], [rimWhite, 0.5], [fill, 0.35], [sqHemi, 0.5], [sqKey, 1.4], [sqRim, 1.1], [smHemi, 0.35], [smKey, 1.6], [smRim, 1.2]];
+const STAGE_LIGHTS = [[pipeHemi, 0.35], [sun, 0.8], [core, 0.6], [dollHemi, 0.3], [rimPink, 0.8], [rimWhite, 0.5], [fill, 0.35], [sqHemi, 0.5], [sqKey, 1.4], [sqRim, 1.1], [smHemi, 0.35], [smKey, 1.6], [smRim, 1.2], [crHemi, 0.4], [crKey, 2.2], [crRim, 1.3]];
 // ---------- environments: Poly Haven HDRIs (CC0) that light and reflect on either machine ----------
 const ENVS = [
   ['builtin', 'Built-in'],
@@ -4283,7 +4777,7 @@ function loadEnv(name) {
 // reflections from an HDRI follow the stage-light dial, well below full, so polished metal doesn't glare
 function applyEnvIntensity() {
   const k = LEVELS.light * (ENV_STATE.name === 'builtin' ? 1 : 0.4);
-  scene.traverse(o => { const m = o.material; if (m && m.isMeshStandardMaterial) m.envMapIntensity = k; });
+  scene.traverse(o => { const m = o.material; if (m && m.isMeshStandardMaterial) m.envMapIntensity = k * (m.userData.envBase ?? 1); });   // a material can ask for less with userData.envBase
 }
 function applyEnvironment() {
   const want = ENV_STATE.name, st = machine.stage();

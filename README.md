@@ -12,6 +12,7 @@ MIDI-driven 3D music machines in the browser. Every note is scheduled ahead of t
 - **Doll Drummer** — a jointed fashion doll on a pink sparkle kit. Sticks wind up ahead of each note, hands and feet are posed with two-bone IK, and the body moves on springs. You can load your own rigged humanoid (`.glb`, `.gltf` or `.zip`) and it's driven the same way.
 - **Squish** — translucent gummy blobs, one per part, on a calm stage. For each note the blob spits a small round piece of itself off the top of its head: the top puckers, the body hops, and the piece is thrown high into the air (about 1 to 2.5 above its head, louder notes higher) on an arc timed like Pipe Rig's balls, so it falls back onto its spot on the head exactly on the beat (low notes on the left, high on the right). The landing is the note: it splats, dents the head and is absorbed straight away; a held note keeps the dent pressed for its length. The blobs are spring-mass soft bodies: they dent, bulge, wobble and settle on their own, and loud hits send rings through the backdrop. The sound comes from the shape: the voice's vowel opens and closes with the blob's squash and its pitch bends with the wobble. Drag a blob to pull it like taffy and it sings, higher the further it stretches. Every blob has glossy eyes set into the jelly: they watch their own pieces fly up and come down, glance at you and at each other, blink, squint on hard hits, go wide when grabbed and droop blissfully during long notes. Every hit flings jelly droplets on real arcs; they stretch as they fly, tick as they land and spread into little splats, or merge back into a blob they fall on. Some pieces leave the head trailing a sticky strand that stretches thin and snaps. Thin edges of the jelly stay bright while thick middles deepen, with a soft sheen at grazing angles.
 - **Smokes** — cigarette packs on a dark tabletop, one per part (drums sit out). Each of a pack's 20 cigarettes is a note, pitch running left to right: a note lifts its cigarette about an inch out of the pack on a spring, the filter glows, smoke pours out and curls upward while the note holds, and it sinks back when the note ends. A breathy wind voice with a chiff and blooming vibrato, made for slow wind melodies.
+- **Crawling Hand** — a marble hand sculpture that scuttles around the floor on its fingertips like a spider. The model comes unrigged, so it is rigged automatically when it loads: the wrist cut, the five fingertips and each finger's centre line are found from the shape of the mesh (surface distance from the wrist and where the fingers branch), a skeleton is placed along them and every vertex is skinned with soft blends at the joints. Each finger reaches the floor with its own IK solver; the fingers step in two alternating groups as the hand wanders, turns and bobs, and a finger too short to reach the floor stays raised, twitching. Every note is a step: a fingertip lands exactly on the beat (low notes toward the little finger, high toward the thumb), knocks out the note on the stone and leaves a glowing print.
 
 ## Run it
 
@@ -21,7 +22,7 @@ You can also open the page any other way and drag `.mid` files onto it. Sampled 
 
 ## Controls
 
-- **Machine** — switch between Pipe Rig, Doll Drummer, Squish and Smokes.
+- **Machine** — switch between Pipe Rig, Doll Drummer, Squish, Smokes and Crawling Hand.
 - **Songs** — load or drop MIDI files, step with `[` / `]`, auto-advance.
 - **Instruments** (Pipe Rig) — turn instrument types on or off for every song.
 - **Effects** — each switches on or off and is remembered:
@@ -58,6 +59,7 @@ Pipe Rig launches each ball at `T − τ` with `v₀ = (P − L)/τ − ½gτ`, 
 - [JSZip](https://stuk.github.io/jszip/) (MIT)
 - HDRI environments in `assets/hdri/`: [Poly Haven](https://polyhaven.com) (CC0)
 - Cigarette pack model in `assets/models/cigarette_pack/`: [Cigarette Pack](https://polyhaven.com/a/cigarette_pack) by Ulrich Büch, Poly Haven (CC0)
+- Hand model in `assets/models/hand_sculpture/` (textures reduced to 2K): this work is based on ["Hand Sculpture"](https://sketchfab.com/3d-models/hand-sculpture-2f36b2523f654144bff4f39ba9e0a81c) by [re1monsen](https://sketchfab.com/re1monsen), licensed under [CC-BY-4.0](http://creativecommons.org/licenses/by/4.0/)
 - Instrument samples: FluidR3 GM by Frank Wen, rendered by [gleitz/midi-js-soundfonts](https://github.com/gleitz/midi-js-soundfonts), [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/)
 - Fonts: Bricolage Grotesque and IBM Plex Mono via Google Fonts (OFL)
 
