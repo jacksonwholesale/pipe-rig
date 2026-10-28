@@ -30,6 +30,8 @@ You can also open the page any other way and drag `.mid` files onto it. Sampled 
   - **Reverb**: a room around the sound
   - **Ball returns**: balls drop into catchers and roll back to the launcher
   - **Auto camera**: follows the busiest instrument; drag or scroll to take over for a few seconds
+  - **Stage light** and **Glow strength** dials
+  - **Environment**: light and reflect either machine with a Poly Haven HDRI (soft studio, neon studio, moonlit trees, Venice sunset, warehouse); **Show as backdrop** puts it behind the stage
 - **Parts** — remap any MIDI part to a different instrument, or add a new one.
 - **Live** — a MIDI device or the keyboard (`A`–`;` marimba, `Z`–`M` bass, `1`–`8` drums), in delayed (full arcs) or instant mode.
 
@@ -45,6 +47,7 @@ Pipe Rig launches each ball at `T − τ` with `v₀ = (P − L)/τ − ½gτ`, 
 
 - [three.js](https://threejs.org) r128 (MIT), plus its GLTFLoader and post-processing examples
 - [JSZip](https://stuk.github.io/jszip/) (MIT)
+- HDRI environments in `assets/hdri/`: [Poly Haven](https://polyhaven.com) (CC0)
 - Instrument samples: FluidR3 GM by Frank Wen, rendered by [gleitz/midi-js-soundfonts](https://github.com/gleitz/midi-js-soundfonts), [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/)
 - Fonts: Bricolage Grotesque and IBM Plex Mono via Google Fonts (OFL)
 

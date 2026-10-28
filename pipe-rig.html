@@ -152,6 +152,8 @@ body.dropping #stage { outline: 3px dashed var(--copper); outline-offset: -12px;
     <span class="chips" id="fxChips" role="group" aria-label="Visual and sound effects"></span>
     <label class="dial" for="lightAmt">Stage light <input id="lightAmt" type="range" min="0.3" max="1.6" step="0.05"></label>
     <label class="dial" for="glowAmt">Glow strength <input id="glowAmt" type="range" min="0" max="2" step="0.05"></label>
+    <label class="dial" for="envSel">Environment <select id="envSel"></select></label>
+    <label class="check"><input type="checkbox" id="envBg"> Show as backdrop</label>
   </div>
   <div class="row">
     <span class="label">Live</span>
@@ -174,6 +176,7 @@ body.dropping #stage { outline: 3px dashed var(--copper); outline-offset: -12px;
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/RGBELoader.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/CopyShader.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/LuminosityHighPassShader.js"></script>
@@ -1153,6 +1156,7 @@ function buildLayout(specs) {
   Object.assign(sun.shadow.camera, { left: -outer - 2, right: outer + 2, top: outer + 2, bottom: -outer - 2, near: 1, far: 80 });
   sun.shadow.camera.updateProjectionMatrix();
   preloadSamples();
+  applyEnvIntensity();
 }
 
 function routeIn(st, note) {
@@ -2239,6 +2243,7 @@ function installCustom(model, label) {
   };
   custom.grip = { L: makeGrip(custom.arm.L), R: makeGrip(custom.arm.R) };
   proceduralParts.forEach(p => p.visible = false);
+  applyEnvIntensity();
   const found = ['spine', 'head', 'thighL', 'thighR'].filter(k => R[k]).length;
   let msg = `${label}: arms rigged${custom.leg.L && custom.leg.R ? ', legs on the pedals' : ', no leg bones found'}${found < 4 ? '' : ', head and spine move'}.`;
   if (!(custom.leg.L && custom.leg.R)) {
@@ -2418,6 +2423,7 @@ function setMachine(id) {
   $('.hud p').textContent = m.blurb;
   $('#kindRow').hidden = id !== 'pipe';
   $('#dollRow').hidden = id !== 'doll';
+  applyEnvironment();
   try { localStorage.setItem('pipeRig.machine', id); } catch { /* remembered for this visit only */ }
 }
 
@@ -2654,10 +2660,77 @@ function toggleFx(k) {
 renderFx();
 // stage light scales every stage lamp on both machines; glow strength scales the bloom
 const STAGE_LIGHTS = [[pipeHemi, 0.35], [sun, 0.8], [core, 0.6], [dollHemi, 0.3], [rimPink, 1.3], [rimWhite, 0.8], [fill, 0.35]];
+// ---------- environments: Poly Haven HDRIs (CC0) that light and reflect on either machine ----------
+const ENVS = [
+  ['builtin', 'Built-in'],
+  ['studio_small_09', 'Soft studio'],
+  ['neon_photostudio', 'Neon studio'],
+  ['dikhololo_night', 'Moonlit trees'],
+  ['venice_sunset', 'Venice sunset'],
+  ['empty_warehouse_01', 'Warehouse'],
+];
+const ENV_STATE = { name: 'builtin', backdrop: false };
+try {
+  const saved = JSON.parse(localStorage.getItem('pipeRig.env'));
+  if (saved && ENVS.some(([n]) => n === saved.name)) Object.assign(ENV_STATE, { name: saved.name, backdrop: !!saved.backdrop });
+} catch { /* built-in */ }
+const envCache = {};
+function loadEnv(name) {
+  if (envCache[name]) return envCache[name];
+  return envCache[name] = new Promise((resolve, reject) => {
+    if (!THREE.RGBELoader) { reject(new Error('the HDRI loader did not load')); return; }
+    new THREE.RGBELoader().setDataType(THREE.HalfFloatType).load(`assets/hdri/${name}_1k.hdr`, tex => {
+      tex.mapping = THREE.EquirectangularReflectionMapping;
+      const pm = new THREE.PMREMGenerator(renderer);
+      const env = pm.fromEquirectangular(tex).texture;
+      pm.dispose();
+      resolve({ env, bg: tex });
+    }, undefined, () => { delete envCache[name]; reject(new Error('the file did not load')); });
+  });
+}
+// reflections from an HDRI follow the stage-light dial, well below full, so polished metal doesn't glare
+function applyEnvIntensity() {
+  const k = LEVELS.light * (ENV_STATE.name === 'builtin' ? 1 : 0.4);
+  scene.traverse(o => { const m = o.material; if (m && m.isMeshStandardMaterial) m.envMapIntensity = k; });
+}
+function applyEnvironment() {
+  const doll = machine === dollMachine, want = ENV_STATE.name;
+  const builtIn = () => {
+    scene.environment = doll ? studioEnv : null;
+    scene.background = doll ? DOLL_BG : PIPE_BG;
+    scene.fog = doll ? null : PIPE_FOG;
+    backdrop.visible = true;
+  };
+  if (want === 'builtin') { builtIn(); applyEnvIntensity(); return; }
+  loadEnv(want).then(e => {
+    if (ENV_STATE.name !== want) return;
+    builtIn();
+    scene.environment = e.env;
+    if (ENV_STATE.backdrop) { scene.background = e.bg; scene.fog = null; backdrop.visible = false; }
+    applyEnvIntensity();
+  }).catch(err => {
+    setStatus(`Couldn't load that environment: ${err.message}. Using the built-in one.`);
+    ENV_STATE.name = 'builtin'; $('#envSel').value = 'builtin';
+    builtIn(); applyEnvIntensity();
+  });
+}
+{
+  const sel = $('#envSel'), bg = $('#envBg');
+  for (const [v, label] of ENVS) { const o = document.createElement('option'); o.value = v; o.textContent = label; sel.appendChild(o); }
+  sel.value = ENV_STATE.name; bg.checked = ENV_STATE.backdrop;
+  const save = () => { try { localStorage.setItem('pipeRig.env', JSON.stringify(ENV_STATE)); } catch { /* still applies now */ } };
+  sel.onchange = () => {
+    ENV_STATE.name = sel.value; save(); applyEnvironment();
+    setStatus(sel.value === 'builtin' ? 'Built-in environment.' : `${sel.selectedOptions[0].textContent} environment (Poly Haven, CC0). Tick "Show as backdrop" to see it behind the stage.`);
+  };
+  bg.onchange = () => { ENV_STATE.backdrop = bg.checked; save(); applyEnvironment(); };
+}
+
 function applyLevels() {
   for (const [l, base] of STAGE_LIGHTS) l.intensity = base * LEVELS.light;
   key.intensity = 1.1 * LEVELS.light;
   setBloom(bloomBase.strength, bloomBase.radius, bloomBase.threshold);
+  applyEnvIntensity();
 }
 for (const [id, k, label] of [['#lightAmt', 'light', 'Stage light'], ['#glowAmt', 'glow', 'Glow strength']]) {
   const el = $(id);
@@ -2758,6 +2831,7 @@ resize();
 playEntry(DEMO, true, 'Demo groove (muted)');
 try { const m = localStorage.getItem('pipeRig.machine'); if (MACHINES[m]) setMachine(m); } catch { /* default machine */ }
 document.querySelectorAll('#machineSeg button').forEach(b => b.onclick = () => setMachine(b.dataset.m));
+applyEnvironment();
 requestAnimationFrame(frame);
 discoverSongs();
 })();
