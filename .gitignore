@@ -3,3 +3,6 @@ test-midi/*
 !test-midi/README.md
 test-models/
 test-mocap/
+
+# copies made only for publishing the Claude artifact (it does not serve .hdr files)
+.artifact/
