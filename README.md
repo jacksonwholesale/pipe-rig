@@ -23,7 +23,8 @@ You can also open the page any other way and drag `.mid` files onto it. Sampled 
 ## Controls
 
 - **Machine** — switch between Pipe Rig, Doll Drummer, Squish, Smokes and Crawling Hand.
-- **Songs** — load or drop MIDI files, step with `[` / `]`, auto-advance.
+- **Songs** — load or drop MIDI files, or **Load folder** to bring in a whole folder of them. Every song you load is kept in your **library** in this browser (also on the live site), with its favourite star, the machine you last played it on and its part mappings, so picking it again switches back to that machine ready to go. Filter the list by name, show **★ only**, **Remove** songs, step with `[` / `]`, auto-advance.
+- **Find** — search [BitMIDI](https://bitmidi.com)'s 100,000+ free, user-uploaded MIDI files from inside the app (press `/`). Each result shows its parts, length and the machine it suits (slow melody → Smokes, many parts → Pipe Rig, drum-led → Doll Drummer); **Play** or **+ Add** it, or press Enter twice to play the top result. You can also paste a link to a `.mid` file, if its site allows other pages to download it. Songs found this way are fan uploads, mostly of copyrighted music: fine to play, not to commit to the repo.
 - **Instruments** (Pipe Rig) — turn instrument types on or off for every song.
 - **Effects** — each switches on or off and is remembered:
   - **Hit lights**: every hit throws a burst of colored light

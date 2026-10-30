@@ -58,6 +58,15 @@ button.primary:hover { background: var(--copper-hi); }
 .seg button[aria-pressed="true"] { background: #243044; color: var(--copper-hi); }
 .filebtn input { position: absolute; width: 1px; height: 1px; opacity: 0; }
 .status { font-family: var(--mono); font-size: 0.75rem; color: var(--muted); min-width: 0; overflow-wrap: anywhere; }
+.row input[type="search"] { flex: 1 1 200px; min-width: 0; font: 0.85rem var(--display); color: var(--fg); background: rgba(255, 255, 255, 0.04); border: 1px solid var(--line); border-radius: 6px; padding: 7px 10px; }
+.row input[type="search"]:focus { outline: 2px solid var(--copper-hi); outline-offset: 1px; }
+#songFilter { flex-basis: 140px; }
+.findres { display: grid; gap: 4px; max-height: 32vh; overflow-y: auto; }
+.fr { display: flex; gap: 8px; align-items: center; font-size: 0.8rem; min-width: 0; }
+.fr .fname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fr .fmeta { font-family: var(--mono); font-size: 0.7rem; color: var(--muted); white-space: nowrap; }
+.fr button, .fmore { padding: 3px 10px; font-size: 0.78rem; }
+.fr button:disabled { opacity: 0.55; cursor: default; }
 .status.live { color: var(--live); }
 .keys { font-family: var(--mono); font-size: 0.72rem; color: var(--muted); }
 .keys kbd { font-family: inherit; color: var(--fg); border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; }
@@ -137,6 +146,7 @@ body.dropping #stage { outline: 3px dashed var(--copper); outline-offset: -12px;
     <span class="label">File</span>
     <button id="playDemo" class="primary">Play demo with sound</button>
     <label class="filebtn">Load MIDI files…<input id="fileIn" type="file" multiple accept=".mid,.midi,audio/midi"></label>
+    <label class="filebtn" title="Add every MIDI file in a folder to your library">Load folder…<input id="folderIn" type="file" webkitdirectory multiple></label>
     <button id="stopBtn">Stop</button>
     <button id="soundBtn">Turn sound on</button>
     <button id="hidePanel" title="Hide the controls to see the whole stage">Hide</button>
@@ -148,7 +158,18 @@ body.dropping #stage { outline: 3px dashed var(--copper); outline-offset: -12px;
     <button id="nextBtn" title="Next song ( ] )">▶</button>
     <button id="restartBtn" title="Play this song from the start">Restart</button>
     <label class="check"><input type="checkbox" id="autoNext" checked> Auto-advance</label>
+    <button id="favBtn" title="Favourite this song">☆</button>
+    <button id="forgetBtn" title="Remove this song from your library">Remove</button>
+    <input id="songFilter" type="search" placeholder="Filter your songs" aria-label="Filter your songs">
+    <label class="check"><input type="checkbox" id="favOnly"> ★ only</label>
   </div>
+  <div class="row" id="findRow">
+    <span class="label">Find</span>
+    <input id="findQ" type="search" placeholder="Search free MIDIs, or paste a .mid link   ( / )" aria-label="Search for MIDI files online">
+    <button id="findBtn">Search</button>
+    <span class="status" id="findNote">Searches BitMIDI: 100,000+ free, user-uploaded MIDI files.</span>
+  </div>
+  <div class="findres" id="findResults" hidden></div>
   <div class="row" id="dollRow" hidden>
     <span class="label">Doll</span>
     <label class="filebtn">Load doll model…<input id="dollIn" type="file" multiple accept=".glb,.gltf,.zip,.bin,.png,.jpg,.jpeg,.webp"></label>
@@ -4374,6 +4395,7 @@ function setMachine(id) {
   $('#dollRow').hidden = id !== 'doll';
   applyEnvironment();
   try { localStorage.setItem('pipeRig.machine', id); } catch { /* remembered for this visit only */ }
+  rememberSong(current);
 }
 
 // ---------- live input ----------
@@ -4466,44 +4488,68 @@ function entryFromFile(name, buf) {
     return Object.assign(makeEntry(name, notes, parts), { tempo });
   } catch (err) { return { name, error: err.message }; }
 }
+// items: { name, buf, rec?, save?, source?, bitmidi? }; a song already in the library isn't added twice
 function addSongs(items, autoplay) {
-  const start = playlist.length;
-  items.forEach(it => playlist.push(entryFromFile(it.name, it.buf)));
+  const got = [];
+  for (const it of items) {
+    const id = it.rec ? it.rec.id : songId(it.name, it.buf), have = playlist.find(e => e.rec && e.rec.id === id);
+    if (have) { got.push(have); continue; }
+    const e = entryFromFile(it.name, it.buf);
+    if (!e.error) {
+      e.buf = it.buf;
+      e.rec = it.rec || { id, name: it.name, source: it.source || 'file', bitmidi: it.bitmidi, added: Date.now(), played: 0, fav: false };
+      // the part mappings it was last played with
+      for (const [k, v] of Object.entries(e.rec.maps || {})) if (MAP_KEYS.includes(k)) e[k] = v;
+      if (it.save !== false) saveSong(e);
+    }
+    playlist.push(e); got.push(e);
+  }
   renderPlaylist();
-  const added = playlist.slice(start), bad = added.filter(e => e.error);
-  const first = playlist.findIndex((e, i) => i >= start && !e.error);
-  if (autoplay && first >= 0) playSong(first);
+  const bad = got.filter(e => e.error), first = got.find(e => !e.error);
+  if (autoplay && first) playSong(playlist.indexOf(first));
   if (bad.length) setStatus(`Skipped ${bad.map(e => `${e.name} (${e.error})`).join(', ')}`);
-  return added.length - bad.length;
+  return got.length - bad.length;
 }
 function renderPlaylist() {
   const sel = $('#songSel');
   sel.innerHTML = '';
+  let shown = 0;
   playlist.forEach((e, i) => {
+    if (!e.error && !playlistVisible(i)) return;
+    if (e.error && ($('#songFilter').value.trim() || $('#favOnly').checked)) return;
     const o = document.createElement('option');
     o.value = i;
-    o.textContent = e.error ? `✕ ${e.name} — ${e.error}` : `${i + 1}. ${e.name.replace(/\.midi?$/i, '')}  ·  ${fmt(e.notes[e.notes.length - 1].time)}`;
+    o.textContent = e.error ? `✕ ${e.name} — ${e.error}` : `${e.rec && e.rec.fav ? '★ ' : ''}${i + 1}. ${e.name.replace(/\.midi?$/i, '')}  ·  ${fmt(e.notes[e.notes.length - 1].time)}`;
     o.disabled = !!e.error;
-    sel.appendChild(o);
+    sel.appendChild(o); shown++;
   });
-  if (cur >= 0) sel.value = cur;
+  if (!shown) { const o = document.createElement('option'); o.textContent = 'No songs match'; o.disabled = true; sel.appendChild(o); }
+  if (cur >= 0 && playlistVisible(cur)) sel.value = cur; else sel.selectedIndex = shown ? -1 : 0;
   $('#songs').hidden = !playlist.length;
+  const e = playlist[cur];
+  $('#favBtn').textContent = e && e.rec && e.rec.fav ? '★' : '☆';
+  $('#favBtn').disabled = $('#forgetBtn').disabled = !e;
 }
 function playSong(i) {
   const e = playlist[i];
   if (!e || e.error) return;
   ensureAudio(); soundOn = true; syncSound();
+  rememberSong(current);
+  // back on the machine it was last played on
+  const back = e.rec && e.rec.machine && MACHINES[e.rec.machine] && MACHINES[e.rec.machine] !== machine ? MACHINES[e.rec.machine] : null;
+  if (back) setMachine(back.id);
   cur = i;
   playEntry(e, false);
-  $('#songSel').value = i;
-  setStatus(`Song ${i + 1} of ${playlist.length}: ${e.name} · ${e.notes.length} notes on ${e.specs.length} instruments. Remap parts below; a new instrument rebuilds the stage.`);
+  if (e.rec) { e.rec.played = Date.now(); saveSong(e); }
+  renderPlaylist();
+  setStatus(`Song ${i + 1} of ${playlist.length}: ${e.name} · ${e.notes.length} notes` + (back ? ` · on ${back.label}, where you last played it` : '') + '. Remap parts below.');
 }
 function step(dir, wrap = true) {
   for (let k = 1; k <= playlist.length; k++) {
     let i = cur + dir * k;
     if (!wrap && (i < 0 || i >= playlist.length)) break;
     i = ((i % playlist.length) + playlist.length) % playlist.length;
-    if (!playlist[i].error) { playSong(i); return true; }
+    if (playlistVisible(i)) { playSong(i); return true; }
   }
   return false;
 }
@@ -4542,6 +4588,186 @@ async function discoverSongs() {
     setStatus(`Found ${ok} songs in test-midi/. Pick one under Songs, or press ] to start the first.`);
   } catch { /* no folder listing: drag files in instead */ }
 }
+
+
+// ---------- your song library: every song you load is kept in this browser ----------
+// Each song is stored with its MIDI bytes, whether it's a favourite, when it was last played, the machine it
+// was last played on and its part mappings, so it comes back next visit ready to go.
+const MAP_KEYS = ['dollMap', 'squishMap', 'smokeMap', 'crawlMap'];
+function songId(name, buf) {
+  const b = new Uint8Array(buf);
+  let h = 2166136261;
+  for (let i = 0; i < b.length; i += Math.max(1, b.length >> 12)) { h ^= b[i]; h = Math.imul(h, 16777619); }
+  return `${name}|${b.length}|${(h >>> 0).toString(36)}`;
+}
+async function saveSong(e) {
+  if (!e || !e.rec || !e.buf) return;
+  try {
+    const db = await openDb();
+    db.transaction('songs', 'readwrite').objectStore('songs').put({ ...e.rec, data: e.buf });
+  } catch { /* the song still plays; it just won't be remembered */ }
+}
+async function forgetSong(e) {
+  try { const db = await openDb(); db.transaction('songs', 'readwrite').objectStore('songs').delete(e.rec.id); } catch { /* nothing stored */ }
+}
+// the machine and part mappings a song was last played with
+function rememberSong(e) {
+  if (!e || !e.rec) return;
+  const maps = {};
+  for (const k of MAP_KEYS) if (e[k]) maps[k] = e[k];
+  const sig = machine.id + JSON.stringify(maps);
+  if (sig === e.rec.sig) return;
+  Object.assign(e.rec, { machine: machine.id, maps, sig });
+  saveSong(e);
+}
+setInterval(() => rememberSong(current), 5000);
+addEventListener('pagehide', () => rememberSong(current));
+async function restoreLibrary() {
+  try {
+    const db = await openDb(), rows = await new Promise((res, rej) => {
+      const r = db.transaction('songs').objectStore('songs').getAll();
+      r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+    });
+    if (!rows.length) return;
+    rows.sort((a, b) => a.added - b.added);
+    const n = addSongs(rows.map(({ data, ...rec }) => ({ name: rec.name, buf: data, rec, save: false })), false);
+    setStatus(`Your library: ${n} song${n === 1 ? '' : 's'}. Pick one under Songs, filter them, or find more online.`);
+  } catch { /* no saved songs */ }
+}
+function playlistVisible(i) {
+  const e = playlist[i], q = $('#songFilter').value.trim().toLowerCase();
+  if (!e || e.error) return false;
+  if (q && !e.name.toLowerCase().includes(q)) return false;
+  return !$('#favOnly').checked || (e.rec && e.rec.fav);
+}
+$('#songFilter').oninput = () => renderPlaylist();
+$('#favOnly').onchange = () => renderPlaylist();
+$('#favBtn').onclick = () => {
+  const e = playlist[cur];
+  if (!e || !e.rec) return;
+  e.rec.fav = !e.rec.fav; saveSong(e); renderPlaylist();
+  setStatus(e.rec.fav ? `★ ${e.name} is a favourite.` : `${e.name} is no longer a favourite.`);
+};
+$('#forgetBtn').onclick = () => {
+  const e = playlist[cur];
+  if (!e) return;
+  if (e.rec) forgetSong(e);
+  playlist.splice(cur, 1);
+  if (current === e) { song = null; $('#tSource').textContent = 'Live input'; }
+  cur = -1; renderPlaylist();
+  setStatus(`Removed ${e.name} from your library.`);
+};
+$('#folderIn').addEventListener('change', e => { readFiles([...e.target.files].filter(f => /\.midi?$/i.test(f.name))); e.target.value = ''; });
+
+// ---------- find MIDI online: BitMIDI's free library, searched and played from here ----------
+// BitMIDI (bitmidi.com) hosts over 100,000 user-uploaded MIDI files and lets pages search and download them
+// directly. Each result is fetched in the background so its parts, length and the machine it suits show up.
+const BITMIDI = 'https://bitmidi.com';
+const find = { q: '', page: 0, results: [], cache: new Map(), more: false };
+const setFindNote = t => { $('#findNote').textContent = t; };
+async function searchMidi(q, page = 0) {
+  q = q.trim();
+  if (!q) return;
+  if (/^https?:\/\//i.test(q)) { loadLink(q); return; }
+  setFindNote(page ? 'Loading more…' : `Searching BitMIDI for “${q}”…`);
+  try {
+    const r = await fetch(`${BITMIDI}/api/midi/search?q=${encodeURIComponent(q)}&page=${page}`);
+    if (!r.ok) throw new Error(String(r.status));
+    const list = ((await r.json()).result || {}).results || [];
+    Object.assign(find, { q, page, results: page ? find.results.concat(list) : list, more: list.length >= 15 });
+    renderFind();
+    setFindNote(find.results.length ? `${find.results.length} result${find.results.length === 1 ? '' : 's'} from BitMIDI (user uploads). Enter plays the top one.` : `Nothing on BitMIDI for “${q}”. Try fewer or different words.`);
+    peekAll(list);
+  } catch (err) { setFindNote(`Couldn't reach BitMIDI (${err.message}). Check the connection and try again.`); }
+}
+// download a result once; later clicks reuse it
+function fetchResult(res) {
+  if (!find.cache.has(res.downloadUrl)) {
+    find.cache.set(res.downloadUrl, fetch(BITMIDI + res.downloadUrl).then(r => (r.ok ? r.arrayBuffer() : Promise.reject(new Error(String(r.status))))).then(buf => {
+      let meta;
+      try {
+        const m = parseMidi(buf), last = m.notes.length ? m.notes[m.notes.length - 1].time : 0;
+        meta = { parts: m.parts.length, notes: m.notes.length, dur: last, drums: m.parts.some(p => p.ch === 9) };
+      } catch (err) { meta = { error: err.message }; }
+      return { buf, meta };
+    }));
+  }
+  return find.cache.get(res.downloadUrl);
+}
+async function peekAll(list) {
+  // a few at a time, so the first rows fill in quickly
+  for (let i = 0; i < list.length; i += 3) await Promise.all(list.slice(i, i + 3).map(res => fetchResult(res).then(() => renderFind()).catch(() => {})));
+}
+// what a song suits, from its shape
+function fitTag(m) {
+  if (m.error) return 'unreadable';
+  if (!m.notes) return 'no notes';
+  const melodic = m.parts - (m.drums ? 1 : 0), rate = m.notes / Math.max(1, m.dur);
+  if (m.drums && melodic <= 1) return 'drum-led · Doll Drummer';
+  if (melodic <= 2 && rate < 5) return 'slow melody · Smokes';
+  if (melodic >= 5) return 'many parts · Pipe Rig';
+  if (melodic <= 3) return 'few parts · Squish';
+  return '';
+}
+function renderFind() {
+  const box = $('#findResults');
+  box.innerHTML = '';
+  box.hidden = !find.results.length;
+  find.results.forEach((res, i) => {
+    const row = document.createElement('div');
+    row.className = 'fr';
+    row.innerHTML = '<span class="fname"></span><span class="fmeta"></span><button class="fplay">Play</button><button class="fadd">+ Add</button>';
+    row.querySelector('.fname').textContent = res.name.replace(/\.midi?$/i, '');
+    row.querySelector('.fname').title = res.name;
+    const meta = row.querySelector('.fmeta'), got = find.cache.get(res.downloadUrl);
+    meta.textContent = `${(res.plays || 0).toLocaleString()} plays`;
+    if (got) got.then(({ meta: m }) => { meta.textContent = m.error ? 'unreadable' : [`${m.parts} part${m.parts === 1 ? '' : 's'}`, fmt(m.dur), fitTag(m)].filter(Boolean).join(' · '); }).catch(() => { meta.textContent = 'download failed'; });
+    const inLib = playlist.some(e => e.rec && e.rec.bitmidi === res.downloadUrl);
+    if (inLib) { row.querySelector('.fadd').textContent = '✓ Added'; row.querySelector('.fadd').disabled = true; }
+    row.querySelector('.fplay').onclick = () => takeResult(res, true);
+    row.querySelector('.fadd').onclick = () => takeResult(res, false);
+    box.appendChild(row);
+  });
+  if (find.more) {
+    const more = document.createElement('button');
+    more.className = 'fmore'; more.textContent = 'More results';
+    more.onclick = () => searchMidi(find.q, find.page + 1);
+    box.appendChild(more);
+  }
+}
+async function takeResult(res, play) {
+  ensureAudio();
+  setFindNote(`Downloading ${res.name}…`);
+  try {
+    const { buf } = await fetchResult(res);
+    const n = addSongs([{ name: res.name, buf, source: 'bitmidi', bitmidi: res.downloadUrl }], play);
+    if (!play) setStatus(n ? `Added ${res.name} to your library.` : `${res.name} could not be read as MIDI.`);
+    setFindNote(n ? (play ? `Playing ${res.name}. It's saved in your library.` : `Added ${res.name}.`) : `${res.name} could not be read as MIDI.`);
+    renderFind();
+  } catch (err) { setFindNote(`Couldn't download ${res.name} (${err.message}).`); }
+}
+async function loadLink(url) {
+  ensureAudio();
+  setFindNote('Loading the link…');
+  try {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`the site answered ${r.status}`);
+    const buf = await r.arrayBuffer(), head = new Uint8Array(buf, 0, 4);
+    if (String.fromCharCode(...head) !== 'MThd') throw new Error("that link isn't a MIDI file (it may be a web page about one)");
+    const name = decodeURIComponent(new URL(url).pathname.split('/').pop() || 'linked song.mid');
+    addSongs([{ name, buf, source: 'link' }], true);
+    setFindNote(`Playing ${name}. It's saved in your library.`);
+  } catch (err) {
+    setFindNote(`Couldn't load that link: ${err.message === 'Failed to fetch' ? 'the site doesn’t allow other pages to download its files. Download it and drop it here instead' : err.message}.`);
+  }
+}
+$('#findBtn').onclick = () => searchMidi($('#findQ').value);
+$('#findQ').addEventListener('keydown', e => {
+  if (e.key !== 'Enter') return;
+  const q = $('#findQ').value.trim();
+  // a second Enter on the same search plays the top result
+  if (q && q === find.q && find.results.length) takeResult(find.results[0], true); else searchMidi(q);
+});
 
 $('#playDemo').onclick = () => { ensureAudio(); soundOn = true; syncSound(); cur = -1; playEntry(DEMO, true); setStatus('Playing the demo groove on a loop across ten instruments.'); };
 $('#stopBtn').onclick = () => { song = null; clearBalls(); resetLimbs(); $('#tSource').textContent = 'Live input'; setStatus('Stopped. Live input and keyboard still work on the current instruments.'); };
@@ -4612,23 +4838,24 @@ function toggleFx(k) {
 renderFx();
 // sound source: instrument sounds, the generated sword kit, or your own takes (kept in this browser)
 function saveSound() { try { localStorage.setItem('pipeRig.sound', JSON.stringify(SOUND)); } catch { /* still applies now */ } }
-function openTakeDb() {
+// this browser's database: your sound takes and your song library
+function openDb() {
   return new Promise((res, rej) => {
-    const r = indexedDB.open('pipeRig', 1);
-    r.onupgradeneeded = () => r.result.createObjectStore('takes', { keyPath: 'id' });
+    const r = indexedDB.open('pipeRig', 2);
+    r.onupgradeneeded = () => { const db = r.result; for (const name of ['takes', 'songs']) if (!db.objectStoreNames.contains(name)) db.createObjectStore(name, { keyPath: 'id' }); };
     r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
   });
 }
 async function saveTakes() {
   try {
-    const db = await openTakeDb(), store = db.transaction('takes', 'readwrite').objectStore('takes');
+    const db = await openDb(), store = db.transaction('takes', 'readwrite').objectStore('takes');
     store.clear();
     kits.mine.takes.forEach((c, id) => store.put({ id, name: c.name, type: c.type, midi: c.midi, sr: c.buffer.sampleRate, data: c.buffer.getChannelData(0) }));
   } catch { /* they last until the page is closed */ }
 }
 async function loadTakes() {
   try {
-    const db = await openTakeDb(), rows = await new Promise((res, rej) => {
+    const db = await openDb(), rows = await new Promise((res, rej) => {
       const r = db.transaction('takes').objectStore('takes').getAll();
       r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
     });
@@ -4851,7 +5078,8 @@ const KEYMAP = {};
 'zxcvbnm'.split('').forEach((k, i) => KEYMAP[k] = [[36, 38, 40, 41, 43, 45, 47][i], 1]);
 '12345678'.split('').forEach((k, i) => KEYMAP[k] = [[36, 38, 42, 46, 45, 48, 49, 51][i], 9]);
 addEventListener('keydown', e => {
-  if (e.repeat || e.ctrlKey || e.metaKey || e.altKey || e.target.tagName === 'SELECT') return;
+  if (e.repeat || e.ctrlKey || e.metaKey || e.altKey || /^(SELECT|INPUT|TEXTAREA)$/.test(e.target.tagName)) return;
+  if (e.key === '/') { e.preventDefault(); if ($('#console').hidden) $('#showPanel').click(); $('#findQ').focus(); return; }
   if (e.key === ']') { step(1); return; }
   if (e.key === '[') { step(-1); return; }
   const m = KEYMAP[e.key.toLowerCase()];
@@ -4922,6 +5150,6 @@ try { const m = localStorage.getItem('pipeRig.machine'); if (MACHINES[m]) setMac
 document.querySelectorAll('#machineSeg button').forEach(b => b.onclick = () => setMachine(b.dataset.m));
 applyEnvironment();
 requestAnimationFrame(frame);
-discoverSongs();
+restoreLibrary().then(discoverSongs);
 })();
 </script>
