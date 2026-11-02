@@ -1,5 +1,6 @@
 <meta charset="utf-8">
 <title>Pipe Rig</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="claude:viewport-fit-sides" content="cover">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=IBM+Plex+Mono:wght@400;500&display=swap">
@@ -113,7 +114,13 @@ button.rec { border-color: #e2554f; color: #ff8a84; }
 body.dropping #stage { outline: 3px dashed var(--copper); outline-offset: -12px; }
 @media (max-width: 560px) {
   .hud p { display: none; }
+  .hud h1 { font-size: 1.3rem; }
   .keys, .formula { display: none; }
+  .console { right: max(16px, env(safe-area-inset-right, 0px)); max-width: none; max-height: 62vh; overflow-y: auto; overscroll-behavior: contain; padding: 10px 12px; }
+  .label { min-width: 0; flex-basis: 100%; }
+  .seg { flex-wrap: wrap; }
+  .partlist { grid-template-columns: 1fr; }
+  button, .filebtn { padding: 8px 12px; }
 }
 </style>
 
@@ -274,9 +281,23 @@ try {
 } catch { /* no storage: everything on */ }
 
 // ---------- renderer / scene ----------
+// Phones and tablets have far less graphics memory, and iOS closes the page when it runs out, so they draw
+// fewer pixels, use smaller shadow maps and half-size model textures, and free each machine's textures when
+// you leave it. ?quality=full or ?quality=lite in the address overrides the guess.
+const LITE = (() => {
+  const q = new URLSearchParams(location.search).get('quality');
+  if (q === 'full' || q === 'lite') return q === 'lite';
+  return matchMedia('(pointer: coarse)').matches || /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+})();
+const SHADOW_SIZE = LITE ? 1024 : 2048;
+// at most this many pixels per frame: the glow pass keeps several full-size copies of the picture
+const PIXEL_BUDGET = LITE ? 1.6e6 : 5e6;
 const canvas = $('#stage');
-const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: !LITE, powerPreference: 'high-performance' });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+// if the phone does drop the picture anyway, say so and carry on when it comes back
+canvas.addEventListener('webglcontextlost', e => { e.preventDefault(); setStatus('The graphics reset (the device ran low on memory). It should come back in a moment.'); });
+canvas.addEventListener('webglcontextrestored', () => setStatus('Graphics are back.'));
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -291,11 +312,15 @@ scene.add(pipeWorld);
 const PIPE_BG = new THREE.Color(0x0b0f17), PIPE_FOG = new THREE.Fog(0x0b0f17, 30, 80);
 scene.background = PIPE_BG; scene.fog = PIPE_FOG;
 
+// tall screens see less from side to side, so the camera stands further back to fit the same stage
+let camFit = 1;
 function resize() {
   const w = canvas.clientWidth, h = canvas.clientHeight;
+  renderer.setPixelRatio(Math.max(1, Math.min(devicePixelRatio, LITE ? 1.5 : 2, Math.sqrt(PIXEL_BUDGET / (w * h)))));
   renderer.setSize(w, h, false);
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
+  camFit = camera.aspect < 1 ? Math.min(2, Math.pow(1 / camera.aspect, 0.8)) : 1;
   reflRT.setSize(Math.round(w * renderer.getPixelRatio() * 0.6), Math.round(h * renderer.getPixelRatio() * 0.6));
   if (composer) { const pr = renderer.getPixelRatio(); composer.setSize(w * pr, h * pr); }
 }
@@ -306,7 +331,7 @@ pipeWorld.add(pipeHemi);
 const sun = new THREE.DirectionalLight(0xfff0dc, 0.8 * LI);
 sun.position.set(6, 22, 12);
 sun.castShadow = true;
-sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.mapSize.set(SHADOW_SIZE, SHADOW_SIZE);
 pipeWorld.add(sun);
 const core = new THREE.PointLight(0xffb070, 0.6 * LI, 16, 0);
 core.position.set(0, 5, 0);
@@ -370,18 +395,34 @@ function renderGlow() {
 const orbit = { theta: 0.15, phi: 0.48, r: 22, target: V(0, 1.8, -1) };
 let lastTouch = -10, drag = null;
 function placeCam() {
-  const { theta, phi, r, target } = orbit;
+  const { theta, phi, target } = orbit, r = orbit.r * camFit;
   camera.position.set(target.x + r * Math.cos(phi) * Math.sin(theta), target.y + r * Math.sin(phi), target.z + r * Math.cos(phi) * Math.cos(theta));
   camera.lookAt(target);
 }
-canvas.addEventListener('pointerdown', e => { drag = { x: e.clientX, y: e.clientY }; canvas.setPointerCapture(e.pointerId); });
+const touches = new Map();
+let pinch = 0;
+const pinchGap = () => { const [a, b] = [...touches.values()]; return Math.hypot(a.x - b.x, a.y - b.y); };
+canvas.addEventListener('pointerdown', e => {
+  touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (touches.size === 2) { pinch = pinchGap(); drag = null; } else drag = { x: e.clientX, y: e.clientY };
+  canvas.setPointerCapture(e.pointerId);
+});
 canvas.addEventListener('pointermove', e => {
+  if (touches.has(e.pointerId)) touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (touches.size === 2 && pinch) {
+    const gap = pinchGap();
+    orbit.r = Math.min(70, Math.max(1.5, orbit.r * pinch / Math.max(1, gap)));
+    pinch = gap; lastTouch = nowSec();
+    return;
+  }
   if (!drag) return;
   orbit.theta -= (e.clientX - drag.x) * 0.005;
   orbit.phi = Math.min(1.35, Math.max(0.06, orbit.phi + (e.clientY - drag.y) * 0.004));
   drag = { x: e.clientX, y: e.clientY }; lastTouch = nowSec();
 });
-canvas.addEventListener('pointerup', () => { drag = null; });
+const lift = e => { touches.delete(e.pointerId); pinch = 0; drag = null; };
+canvas.addEventListener('pointerup', lift);
+canvas.addEventListener('pointercancel', lift);
 canvas.addEventListener('wheel', e => { e.preventDefault(); orbit.r = Math.min(70, Math.max(1.5, orbit.r * Math.exp(e.deltaY * 0.001))); lastTouch = nowSec(); }, { passive: false });
 
 // ---------- rig maths ----------
@@ -2043,7 +2084,7 @@ const backdrop = new THREE.Mesh(new THREE.SphereGeometry(40, 48, 24), new THREE.
 dollWorld.add(backdrop);
 
 // mirror floor: the stage is rendered from a camera mirrored under the floor, then projected onto it
-const reflRT = new THREE.WebGLRenderTarget(1024, 1024);
+const reflRT = new THREE.WebGLRenderTarget(LITE ? 512 : 1024, LITE ? 512 : 1024);
 const mirrorCam = new THREE.PerspectiveCamera();
 const texMatrix = new THREE.Matrix4();
 const floor = new THREE.Mesh(new THREE.CircleGeometry(40, 96), new THREE.ShaderMaterial({
@@ -2079,7 +2120,7 @@ const dollHemi = new THREE.HemisphereLight(0xfff0f6, 0xd8679c, 0.3 * LI);
 dollWorld.add(dollHemi);
 const key = new THREE.SpotLight(0xffffff, 1.1 * LI, 0, 0.55, 0.65, 0);
 key.position.set(2.4, 4.6, 3.6); key.target = dollRoot;
-key.castShadow = true; key.shadow.mapSize.set(2048, 2048); key.shadow.bias = -0.0004; key.shadow.radius = 4;
+key.castShadow = true; key.shadow.mapSize.set(SHADOW_SIZE, SHADOW_SIZE); key.shadow.bias = -0.0004; key.shadow.radius = 4;
 dollWorld.add(key);
 const rimPink = new THREE.PointLight(0xff5fae, 0.8 * LI, 9, 0); rimPink.position.set(-2.2, 2.6, -2); dollWorld.add(rimPink);
 const rimWhite = new THREE.PointLight(0xffffff, 0.5 * LI, 9, 0); rimWhite.position.set(2.2, 2.2, -2.4); dollWorld.add(rimWhite);
@@ -2857,7 +2898,7 @@ squishWorld.add(sqFloor);
 const sqHemi = new THREE.HemisphereLight(0xe8ecff, 0x6a6080, 0.5 * LI);
 const sqKey = new THREE.DirectionalLight(0xfff4ea, 1.4 * LI);
 sqKey.position.set(-4, 9, 6); sqKey.castShadow = true;
-sqKey.shadow.mapSize.set(2048, 2048); sqKey.shadow.radius = 6; sqKey.shadow.bias = -0.0005;
+sqKey.shadow.mapSize.set(SHADOW_SIZE, SHADOW_SIZE); sqKey.shadow.radius = 6; sqKey.shadow.bias = -0.0005;
 Object.assign(sqKey.shadow.camera, { left: -8, right: 8, top: 8, bottom: -8, near: 1, far: 30 });
 const sqRim = new THREE.DirectionalLight(0xcfe0ff, 1.1 * LI);
 sqRim.position.set(5, 4, -7);
@@ -3501,7 +3542,7 @@ smokeWorld.add(smTable);
 const smHemi = new THREE.HemisphereLight(0xffe2c4, 0x2a1810, 0.35 * LI);
 const smKey = new THREE.SpotLight(0xffd6a8, 1.6 * LI, 0, 0.45, 0.8, 0);
 smKey.position.set(-2.2, 3.6, 2.6); smKey.target.position.set(0, 0.6, 0);
-smKey.castShadow = true; smKey.shadow.mapSize.set(2048, 2048); smKey.shadow.radius = 5; smKey.shadow.bias = -0.0004;
+smKey.castShadow = true; smKey.shadow.mapSize.set(SHADOW_SIZE, SHADOW_SIZE); smKey.shadow.radius = 5; smKey.shadow.bias = -0.0004;
 // a cool light from behind catches the smoke and rims the packs
 const smRim = new THREE.DirectionalLight(0xb8ccff, 1.2 * LI);
 smRim.position.set(1.5, 2.5, -4);
@@ -3509,11 +3550,14 @@ smokeWorld.add(smHemi, smKey, smKey.target, smRim);
 
 // ---------- the model, split into a pack and twenty cigarettes ----------
 let packModel = null, packLoading = null;
+// phones load the half-size copies in each model's textures/1k folder
+const modelFiles = new THREE.LoadingManager();
+if (LITE) modelFiles.setURLModifier(u => u.replace(/textures\/([^/?#]+\.jpg)$/, 'textures/1k/$1'));
 function loadPackModel() {
   if (packModel) return Promise.resolve(packModel);
   if (packLoading) return packLoading;
   const base = 'assets/models/cigarette_pack/';
-  const parse = text => new Promise((res, rej) => new THREE.GLTFLoader().parse(text, base, res, e => rej(new Error(e && e.message ? e.message : 'the model could not be read'))));
+  const parse = text => new Promise((res, rej) => new THREE.GLTFLoader(modelFiles).parse(text, base, res, e => rej(new Error(e && e.message ? e.message : 'the model could not be read'))));
   return packLoading = (async () => {
     let gltf;
     try {
@@ -3884,7 +3928,7 @@ crawlWorld.add(crFloor);
 const crHemi = new THREE.HemisphereLight(0xe8ecff, 0x2a2622, 0.4 * LI);
 const crKey = new THREE.SpotLight(0xfff0dc, 2.2 * LI, 0, 0.5, 0.8, 0);
 crKey.position.set(-2, 4.5, 2.5); crKey.castShadow = true;
-crKey.shadow.mapSize.set(2048, 2048); crKey.shadow.radius = 4; crKey.shadow.bias = -0.0003;
+crKey.shadow.mapSize.set(SHADOW_SIZE, SHADOW_SIZE); crKey.shadow.radius = 4; crKey.shadow.bias = -0.0003;
 const crRim = new THREE.DirectionalLight(0xbfd2ff, 1.3 * LI);
 crRim.position.set(2, 2.5, -4);
 crawlWorld.add(crHemi, crKey, crKey.target, crRim);
@@ -3896,7 +3940,7 @@ function loadHand() {
   if (handRig) return Promise.resolve(handRig);
   if (handLoading) return handLoading;
   const base = 'assets/models/hand_sculpture/';
-  const parse = (text, path) => new Promise((res, rej) => new THREE.GLTFLoader().parse(text, path, res, e => rej(new Error(e && e.message ? e.message : 'the model could not be read'))));
+  const parse = (text, path) => new Promise((res, rej) => new THREE.GLTFLoader(modelFiles).parse(text, path, res, e => rej(new Error(e && e.message ? e.message : 'the model could not be read'))));
   return handLoading = (async () => {
     let gltf;
     try {
@@ -4377,10 +4421,17 @@ function pumpSong(now) {
     onSongEnd();
   }
 }
+function releaseGpu(world) {
+  world.traverse(o => {
+    if (o.isLight && o.shadow && o.shadow.map) { o.shadow.map.dispose(); o.shadow.map = null; }
+    for (const mat of [].concat(o.material || [])) for (const v of Object.values(mat)) if (v && v.isTexture && !v.isRenderTargetTexture) v.dispose();
+  });
+}
 function setMachine(id) {
   const m = MACHINES[id];
   if (!m || m === machine) return;
   machine.exit();
+  if (LITE) releaseGpu({ pipe: pipeWorld, doll: dollWorld, squish: squishWorld, smokes: smokeWorld, hand: crawlWorld }[machine.id]);
   machine = m;
   machine.enter();
   director.shot = null;
@@ -5145,6 +5196,7 @@ function frame() {
   requestAnimationFrame(frame);
 }
 resize();
+if (matchMedia('(max-width: 560px)').matches) { $('#console').hidden = true; $('#showPanel').hidden = false; }
 playEntry(DEMO, true, 'Demo groove (muted)');
 try { const m = localStorage.getItem('pipeRig.machine'); if (MACHINES[m]) setMachine(m); } catch { /* default machine */ }
 document.querySelectorAll('#machineSeg button').forEach(b => b.onclick = () => setMachine(b.dataset.m));
