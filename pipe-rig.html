@@ -333,7 +333,8 @@ const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 300);
 // each machine keeps its scenery, lights and balls in its own world group, shown only while active
 const pipeWorld = new THREE.Group();
 scene.add(pipeWorld);
-const PIPE_BG = new THREE.Color(0x0b0f17), PIPE_FOG = new THREE.Fog(0x0b0f17, 30, 80);
+// fog is mixed in before the output conversion, so its color is given in linear terms to match the sky it fades into
+const PIPE_BG = new THREE.Color(0x0b0f17), PIPE_FOG = new THREE.Fog(new THREE.Color(0x0b0f17).convertSRGBToLinear(), 30, 80);
 scene.background = PIPE_BG; scene.fog = PIPE_FOG;
 
 // tall screens see less from side to side, so the camera stands further back to fit the same stage
@@ -361,7 +362,21 @@ const core = new THREE.PointLight(0xffb070, 0.6 * LI, 16, 0);
 core.position.set(0, 5, 0);
 pipeWorld.add(core);
 
+// A pool of light on a dark floor. Lit evenly, a floor stays pale far into the distance, and seen from low down
+// that whole fade squeezes into a few pixels under the horizon: a hard edge. This darkens it away from the action
+// (pool: x, z, radius where it starts, radius where it's dark) until it meets the fog, so the stage has no edge.
+function floorPool(mat, pool) {
+  mat.onBeforeCompile = sh => {
+    sh.uniforms.uPool = { value: pool };
+    sh.vertexShader = 'varying vec3 vPoolW;\n' + sh.vertexShader.replace('#include <project_vertex>', '#include <project_vertex>\n  vPoolW = (modelMatrix * vec4(transformed, 1.0)).xyz;');
+    sh.fragmentShader = 'uniform vec4 uPool;\nvarying vec3 vPoolW;\n' + sh.fragmentShader.replace('#include <fog_fragment>',
+      'gl_FragColor.rgb *= mix(1.0, 0.08, smoothstep(uPool.z, uPool.w, distance(vPoolW.xz, uPool.xy)));\n#include <fog_fragment>');
+  };
+  return pool;
+}
 const ground = new THREE.Mesh(new THREE.PlaneGeometry(200, 200), new THREE.MeshStandardMaterial({ color: 0x0c1018, roughness: 1 }));
+ground.material.userData.envBase = 0.03;
+const groundPool = floorPool(ground.material, new THREE.Vector4(0, 0, 14, 34));
 ground.rotation.x = -Math.PI / 2;
 ground.receiveShadow = true;
 pipeWorld.add(ground);
@@ -1547,6 +1562,7 @@ function buildLayout(specs) {
   // frame the camera and lights on whatever was built
   const outer = R + 2;
   ring.scale.setScalar(outer + 0.5);
+  groundPool.z = outer + 3; groundPool.w = outer * 2.4 + 10;
   orbit.r = Math.min(70, Math.max(24, outer * 2.4));
   orbit.phi = Math.max(orbit.phi, 0.62);   // look down over the front instruments into the circle
   orbit.target.set(0, 1.6, 0);
@@ -1943,8 +1959,8 @@ function danceStations() {
 const pipeMachine = {
   id: 'pipe', label: 'Pipe Rig', blurb: 'Each note fires a ball early enough to land exactly on the beat. Drag to orbit, scroll to zoom.',
   lead: () => Math.max(maxTau * 1.15, selfLead) + 0.15,
-  stage: () => ({ env: null, bg: PIPE_BG, fog: PIPE_FOG }),
-  enter() { pipeWorld.visible = true; scene.background = PIPE_BG; scene.fog = PIPE_FOG; scene.environment = null; setBloom(0.6, 0.4, 0.95); },
+  stage: () => ({ env: squishEnv, bg: PIPE_BG, fog: PIPE_FOG }),
+  enter() { pipeWorld.visible = true; scene.background = PIPE_BG; scene.fog = PIPE_FOG; scene.environment = squishEnv; setBloom(0.6, 0.4, 0.95); },
   exit() { clearLayout(); pipeWorld.visible = false; },
   load(entry) {
     if (entry.kindsSig !== kindsSig()) assignParts(entry);   // instrument toggles changed since this song was set up
@@ -3523,7 +3539,7 @@ const squishMachine = {
     const busy = blobs.reduce((m, b) => (!m || b.heat > m.heat ? b : m), null), roll = Math.random();
     if (!busy || busy.heat < 0.4 || roll < 0.3) return { theta: (Math.random() - 0.5) * 0.5, phi: 0.24, r: this.wide, target: V(0, 1.3, 0), drift: 0.02 };
     const bp = busy.mesh.position;
-    if (roll < 0.75) return { theta: (Math.random() - 0.5) * 0.8, phi: 0.18, r: 3.6 + busy.size, target: V(bp.x, 1.3, bp.z), drift: 0.03 };
+    if (roll < 0.75) return { theta: (Math.random() - 0.5) * 0.8, phi: 0.3, r: 4.6 + busy.size, target: V(bp.x, 1.3, bp.z), drift: 0.03 };
     if (roll < 0.9) return { theta: (Math.random() - 0.5) * 0.6, phi: 0.04, r: this.wide * 0.65, target: V(0, 1.4, 0), drift: 0.02 };
     return { theta: 0, phi: 1.1, r: this.wide * 0.8, target: V(0, 0, 0), drift: 0.03 };
   },
@@ -3553,6 +3569,7 @@ const smokeWorld = new THREE.Group();
 smokeWorld.visible = false;
 scene.add(smokeWorld);
 const SMOKE_BG = new THREE.Color(0x120e0c);
+const SMOKE_FOG = new THREE.Fog(new THREE.Color(...[0.10, 0.075, 0.06].map(v => Math.pow(v, 2.2))), 6, 22);
 const PACK_SCALE = 10;        // the model is life size (10 cm tall); scaled up so a pack stands about a metre
 const CIG_RISE = 0.0254;      // an inch, in model units (metres)
 const smBackdrop = new THREE.Mesh(new THREE.SphereGeometry(60, 32, 16), new THREE.ShaderMaterial({
@@ -3560,16 +3577,18 @@ const smBackdrop = new THREE.Mesh(new THREE.SphereGeometry(60, 32, 16), new THRE
   vertexShader: `varying vec3 v_dir; void main () { v_dir = normalize(position); gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
   fragmentShader: `varying vec3 v_dir; void main () {
       vec3 d = normalize(v_dir);
-      vec3 c = mix(vec3(0.10, 0.075, 0.06), vec3(0.22, 0.16, 0.12), smoothstep(-0.1, 0.5, d.y) * (1.0 - smoothstep(0.2, 1.0, abs(d.x))));
+      vec3 c = mix(vec3(0.10, 0.075, 0.06), vec3(0.22, 0.16, 0.12), smoothstep(0.0, 0.5, d.y) * (1.0 - smoothstep(0.2, 1.0, abs(d.x))));
       gl_FragColor = linearToOutputTexel(vec4(pow(c, vec3(2.2)), 1.0));
     }`,
 }));
 smokeWorld.add(smBackdrop);
-const smTable = new THREE.Mesh(new THREE.CircleGeometry(40, 64), new THREE.MeshStandardMaterial({ color: 0x1a110c, roughness: 0.45, metalness: 0 }));
+const smTable = new THREE.Mesh(new THREE.CircleGeometry(40, 64), new THREE.MeshStandardMaterial({ color: 0x1a110c, roughness: 0.62, metalness: 0 }));
+smTable.material.userData.envBase = 0.12;
+floorPool(smTable.material, new THREE.Vector4(0, 0, 1.8, 7));
 smTable.rotation.x = -Math.PI / 2; smTable.receiveShadow = true;
 smokeWorld.add(smTable);
 const smHemi = new THREE.HemisphereLight(0xffe2c4, 0x2a1810, 0.35 * LI);
-const smKey = new THREE.SpotLight(0xffd6a8, 1.6 * LI, 0, 0.45, 0.8, 0);
+const smKey = new THREE.SpotLight(0xffd6a8, 1.6 * LI, 0, 0.45, 1, 0);
 smKey.position.set(-2.2, 3.6, 2.6); smKey.target.position.set(0, 0.6, 0);
 smKey.castShadow = true; smKey.shadow.mapSize.set(SHADOW_SIZE, SHADOW_SIZE); smKey.shadow.radius = 5; smKey.shadow.bias = -0.0004;
 // a cool light from behind catches the smoke and rims the packs
@@ -3878,9 +3897,9 @@ const smokeMachine = {
   id: 'smokes', label: 'Smokes', blurb: 'Each note lifts a cigarette an inch out of the pack, its tip glowing, smoke pouring out while the note holds. Made for slow wind melodies. Drag to orbit, scroll to zoom.',
   wide: 2.8,
   lead: () => SMOKE_LEAD + 0.1,
-  stage: () => ({ env: squishEnv, bg: SMOKE_BG, fog: null, backdrop: smBackdrop }),
+  stage: () => ({ env: squishEnv, bg: SMOKE_BG, fog: SMOKE_FOG, backdrop: smBackdrop }),
   enter() {
-    smokeWorld.visible = true; scene.background = SMOKE_BG; scene.fog = null; scene.environment = squishEnv; setBloom(0.6, 0.5, 1.1);
+    smokeWorld.visible = true; scene.background = SMOKE_BG; scene.fog = SMOKE_FOG; scene.environment = squishEnv; setBloom(0.6, 0.5, 1.1);
     Object.assign(orbit, { theta: 0.25, phi: 0.32, r: this.wide }); orbit.target.set(0, 0.85, 0);
   },
   exit() { smokeWorld.visible = false; scene.environment = null; },
@@ -3944,22 +3963,27 @@ const crawlWorld = new THREE.Group();
 crawlWorld.visible = false;
 scene.add(crawlWorld);
 const CRAWL_BG = new THREE.Color(0x15161a);
+// a seamless studio: the floor fades into the fog, and the fog is the wall's color at the horizon, so there's no seam
+const CR_HORIZON = [0.11, 0.11, 0.125], CRAWL_FOG = new THREE.Fog(new THREE.Color(...CR_HORIZON.map(v => Math.pow(v, 2.2))), 2, 7);
 const crBackdrop = new THREE.Mesh(new THREE.SphereGeometry(60, 32, 16), new THREE.ShaderMaterial({
   side: THREE.BackSide, depthWrite: false,
   vertexShader: `varying vec3 v_dir; void main () { v_dir = normalize(position); gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
   fragmentShader: `varying vec3 v_dir; void main () {
       vec3 d = normalize(v_dir);
-      vec3 c = mix(vec3(0.06, 0.06, 0.075), vec3(0.2, 0.2, 0.23), smoothstep(-0.1, 0.6, d.y));
+      vec3 c = mix(vec3(0.11, 0.11, 0.125), vec3(0.2, 0.2, 0.23), smoothstep(0.0, 0.6, d.y));
       gl_FragColor = linearToOutputTexel(vec4(pow(c, vec3(2.2)), 1.0));
     }`,
 }));
 crawlWorld.add(crBackdrop);
-const crFloor = new THREE.Mesh(new THREE.CircleGeometry(40, 96), new THREE.MeshStandardMaterial({ color: 0x141418, roughness: 0.42, metalness: 0 }));
-crFloor.material.userData.envBase = 0.35;
+const crFloor = new THREE.Mesh(new THREE.CircleGeometry(40, 96), new THREE.MeshStandardMaterial({ color: 0x141418, roughness: 0.6, metalness: 0 }));
+crFloor.material.userData.envBase = 0.12;
+const crPool = floorPool(crFloor.material, new THREE.Vector4(0, 0, 0.5, 2.6));   // the white room in the reflections would wash a dark floor out to pale grey
 crFloor.rotation.x = -Math.PI / 2; crFloor.receiveShadow = true;
 crawlWorld.add(crFloor);
 const crHemi = new THREE.HemisphereLight(0xe8ecff, 0x2a2622, 0.4 * LI);
-const crKey = new THREE.SpotLight(0xfff0dc, 2.2 * LI, 0, 0.5, 0.8, 0);
+// a follow-spot: it trails the hand, so the hand always crawls in its own soft pool of light and the floor
+// beyond falls away into the dark
+const crKey = new THREE.SpotLight(0xfff0dc, 2.2 * LI, 0, 0.32, 1, 0);
 crKey.position.set(-2, 4.5, 2.5); crKey.castShadow = true;
 crKey.shadow.mapSize.set(SHADOW_SIZE, SHADOW_SIZE); crKey.shadow.radius = 4; crKey.shadow.bias = -0.0003;
 const crRim = new THREE.DirectionalLight(0xbfd2ff, 1.3 * LI);
@@ -4320,6 +4344,8 @@ function updateCrawl(now, dt) {
   // the body: carried along, bobbing as it steps, leaning toward the side that's pushing
   const bob = Math.sin(now * 9 * (0.5 + crawl.speed * 2)) * 0.006 * Math.min(1, crawl.speed * 6);
   crawl.group.position.set(crawl.pos.x, crawl.height + bob, crawl.pos.z);
+  crPool.x = crawl.pos.x; crPool.y = crawl.pos.z;
+  crKey.position.set(crawl.pos.x - 2, 4.5, crawl.pos.z + 2.5); crKey.target.position.set(crawl.pos.x, 0, crawl.pos.z);
   crawl.group.rotation.set(0.05 * Math.sin(now * 2.3) * grooveAmt(), crawl.yaw, -dy * 0.15);
   // legs: swinging ones arc toward their landing; planted ones stay put; every finger reaches its tip
   for (const l of legs) {
@@ -4367,9 +4393,9 @@ function crawlRange(entry) {
 const crawlMachine = {
   id: 'hand', label: 'Crawling Hand', blurb: 'A marble hand crawls the floor on its fingertips. Every note is a step that lands right on the beat. Drag to orbit, scroll to zoom.',
   lead: () => 0.4,
-  stage: () => ({ env: squishEnv, bg: CRAWL_BG, fog: null, backdrop: crBackdrop }),
+  stage: () => ({ env: squishEnv, bg: CRAWL_BG, fog: CRAWL_FOG, backdrop: crBackdrop }),
   enter() {
-    crawlWorld.visible = true; scene.background = CRAWL_BG; scene.fog = null; scene.environment = squishEnv; setBloom(0.5, 0.45, 1.2);
+    crawlWorld.visible = true; scene.background = CRAWL_BG; scene.fog = CRAWL_FOG; scene.environment = squishEnv; setBloom(0.5, 0.45, 1.2);
     Object.assign(orbit, { theta: 0.6, phi: 0.4, r: 1.8 }); orbit.target.set(crawl.pos.x, 0.1, crawl.pos.z);
     loadHand().then(rig => { if (!crawl.ready) setupCrawl(rig); setStatus('The hand is rigged: ' + rig.fingers.map(f => f.name).join(', ') + ' found. It walks on all five.'); })
       .catch(err => setStatus(`Couldn't rig the hand: ${err.message}.`));
