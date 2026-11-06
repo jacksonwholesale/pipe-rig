@@ -111,6 +111,11 @@ body[data-machine="squish"] .hud { text-shadow: 0 0 8px rgba(255, 255, 255, 0.85
 #kitTools { display: inline-flex; gap: 6px; flex-wrap: wrap; }
 button.rec { border-color: #e2554f; color: #ff8a84; }
 .showpanel { position: fixed; bottom: calc(env(safe-area-inset-bottom, 0px) + 14px); left: max(16px, env(safe-area-inset-left, 0px)); background: var(--panel); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); }
+.filmbox { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; background: rgba(5, 8, 14, 0.72); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
+.filmcard { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px; width: min(760px, calc(100% - 32px)); display: flex; flex-direction: column; gap: 10px; }
+#filmPrev { width: 100%; max-height: 58vh; object-fit: contain; background: #000; border-radius: 6px; }
+#filmBar { width: 100%; accent-color: var(--copper); }
+#filmSave { text-decoration: none; }
 body.dropping #stage { outline: 3px dashed var(--copper); outline-offset: -12px; }
 @media (max-width: 560px) {
   .hud p { display: none; }
@@ -138,6 +143,15 @@ body.dropping #stage { outline: 3px dashed var(--copper); outline-offset: -12px;
 </div>
 
 <button id="showPanel" class="showpanel" hidden>Show controls</button>
+<div class="filmbox" id="filmBox" hidden role="dialog" aria-label="Recording a video">
+  <div class="filmcard">
+    <div class="row"><b>Recording</b><span class="status" id="filmNote"></span></div>
+    <canvas id="filmPrev"></canvas>
+    <progress id="filmBar" max="1" value="0"></progress>
+    <span class="status">Keep this tab in front while it records: browsers pause video encoding in hidden tabs.</span>
+    <div class="row"><a id="filmSave" class="filebtn" hidden>Save video</a><button id="filmCancel">Cancel</button><button id="filmClose">Close</button></div>
+  </div>
+</div>
 <div class="console" id="console">
   <div class="row">
     <span class="label">Machine</span>
@@ -208,6 +222,14 @@ body.dropping #stage { outline: 3px dashed var(--copper); outline-offset: -12px;
     </span>
     <span class="chips" id="kitTakes" hidden></span>
   </div>
+  <div class="row" id="filmRow">
+    <span class="label">Film</span>
+    <label class="dial" for="filmFormat">Shape <select id="filmFormat"></select></label>
+    <label class="dial" for="filmFps">Frames <select id="filmFps"><option value="60">60 fps</option><option value="30">30 fps</option></select></label>
+    <label class="check" title="Ambient occlusion, sharper shadows and every frame drawn at twice the size: slower to record, better looking"><input type="checkbox" id="filmHq"> Film quality</label>
+    <label class="check"><input type="checkbox" id="filmTitles"> Title</label>
+    <button id="filmBtn" class="primary" title="Render the current song on this machine, frame by frame, into a video file with its sound">Record video</button>
+  </div>
   <div class="row">
     <span class="label">Live</span>
     <button id="midiBtn">Connect MIDI input</button>
@@ -253,7 +275,9 @@ CORE.ColorManagement.enabled = false;
 <script type="module">
 (() => {
 const $ = s => document.querySelector(s);
-const nowSec = () => performance.now() / 1000;
+// the film steps its own clock one frame at a time; otherwise this is the wall clock
+let filmT = null;
+const nowSec = () => filmT ?? performance.now() / 1000;
 const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
 const V = (x, y, z) => new THREE.Vector3(x, y, z);
 
@@ -445,23 +469,28 @@ const brassMat = shared(new THREE.MeshStandardMaterial({ color: 0xc9a14a, metaln
 // ---------- audio ----------
 let actx = null, master = null, noiseBuf = null, soundOn = false, reverbWet = null;
 const mtof = n => 440 * Math.pow(2, (n - 69) / 12);
+// where "now" is on the sound clock: the live context's, or the film's offline one, which starts with the recording
+const audioNow = () => filmT === null ? actx.currentTime : filmT - filmT0;
 function ensureAudio() {
   if (!actx) {
-    actx = new (window.AudioContext || window.webkitAudioContext)();
-    const comp = actx.createDynamicsCompressor();
-    master = actx.createGain(); master.gain.value = 0.5;
-    master.connect(comp).connect(actx.destination);
-    // reverb: a generated room tail mixed in beside the dry signal
-    const conv = actx.createConvolver(); conv.buffer = roomImpulse(2.4);
-    reverbWet = actx.createGain(); reverbWet.gain.value = FX.reverb ? 0.3 : 0;
-    master.connect(conv).connect(reverbWet).connect(comp);
-    noiseBuf = actx.createBuffer(1, actx.sampleRate, actx.sampleRate);
-    const d = noiseBuf.getChannelData(0);
-    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    buildAudio(new (window.AudioContext || window.webkitAudioContext)());
     preloadSamples();
     prepareKit();
   }
-  if (actx.state === 'suspended') actx.resume();
+  if (actx.state === 'suspended' && filmT === null) actx.resume();
+}
+function buildAudio(ctx) {
+  actx = ctx;
+  const comp = actx.createDynamicsCompressor();
+  master = actx.createGain(); master.gain.value = 0.5;
+  master.connect(comp).connect(actx.destination);
+  // reverb: a generated room tail mixed in beside the dry signal
+  const conv = actx.createConvolver(); conv.buffer = roomImpulse(2.4);
+  reverbWet = actx.createGain(); reverbWet.gain.value = FX.reverb ? 0.3 : 0;
+  master.connect(conv).connect(reverbWet).connect(comp);
+  noiseBuf = actx.createBuffer(1, actx.sampleRate, actx.sampleRate);
+  const d = noiseBuf.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
 }
 function roomImpulse(sec) {
   const n = Math.floor(actx.sampleRate * sec), b = actx.createBuffer(2, n, actx.sampleRate);
@@ -643,7 +672,7 @@ function samplePlay(kind, midi, t, vel, d) {
 // one note on one instrument kind: the sound kit when one is chosen, else the recorded sample when it's loaded, else the synth voice
 function playNote(kind, midi, hitAbs, vel, dur) {
   if (!soundOn || !actx) return;
-  const t = actx.currentTime + Math.max(0, hitAbs - nowSec());
+  const t = audioNow() + Math.max(0, hitAbs - nowSec());
   const d = FX.hold && dur ? dur : null;
   if (kitPlay(midi, t, vel, d)) return;
   if (FX.samples && samplePlay(kind, midi, t, vel, d)) return;
@@ -857,7 +886,7 @@ function kitHit(kit, take, midi, t, vel, pan = rnd(-0.6, 0.6), small = false) {
   if (small) return;
   // a flam: a quieter grace hit just ahead of a loud one
   const tg = t - rnd(0.025, 0.05);
-  if (vel > 0.75 && Math.random() < 0.2 && tg > actx.currentTime) kitHit(kit, pickTake(kit.hits.length ? kit.hits : kit.scrapes, midi, take), midi, tg, vel * 0.45, pan + rnd(-0.2, 0.2), true);
+  if (vel > 0.75 && Math.random() < 0.2 && tg > audioNow()) kitHit(kit, pickTake(kit.hits.length ? kit.hits : kit.scrapes, midi, take), midi, tg, vel * 0.45, pan + rnd(-0.2, 0.2), true);
   // settling: a few tiny rattles as the blade comes to rest
   if (Math.random() < 0.22) {
     let tr = t + rnd(0.08, 0.16), v = vel * 0.3;
@@ -908,7 +937,7 @@ const KIT_DRUMS = {
 };
 function playDrum(name, hitAbs, vel) {
   if (!soundOn || !actx) return;
-  const t = actx.currentTime + Math.max(0, hitAbs - nowSec()), kit = activeKit(), m = KIT_DRUMS[name];
+  const t = audioNow() + Math.max(0, hitAbs - nowSec()), kit = activeKit(), m = KIT_DRUMS[name];
   if (!kit || SOUND.keepDrums || !m) { VOICES.drums(name)(t, vel); return; }
   if (typeof m[1] === 'number' && kit.scrapes.length) kitScrape(kit, pickTake(kit.scrapes, m[0]), m[0], t, vel, m[1]);
   else kitHit(kit, pickTake(kit.hits.length ? kit.hits : kit.scrapes, m[0]), m[0], t, vel, rnd(-0.6, 0.6), m[1] === 'tick');
@@ -2078,7 +2107,7 @@ const backdrop = new THREE.Mesh(new THREE.SphereGeometry(40, 48, 24), new THREE.
   uniforms: { top: { value: lin(0xfff2f7) }, mid: { value: lin(0xf7b7d2) }, bottom: { value: lin(0xe887b3) } },
   vertexShader: 'varying vec3 vP; void main(){ vP = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
   fragmentShader: `uniform vec3 top; uniform vec3 mid; uniform vec3 bottom; varying vec3 vP;
-    void main(){ float h = normalize(vP).y; vec3 c = h > 0.0 ? mix(mid, top, smoothstep(0.0, 0.6, h)) : mix(mid, bottom, smoothstep(0.0, -0.3, h));
+    void main(){ float h = normalize(vP).y; vec3 c = h > 0.0 ? mix(mid, top, smoothstep(0.0, 0.6, h)) : mix(mid, bottom, (1.0 - smoothstep(-0.3, 0.0, h)));
     gl_FragColor = linearToOutputTexel(vec4(c, 1.0)); }`,
 }));
 dollWorld.add(backdrop);
@@ -2880,7 +2909,7 @@ const sqBackdrop = new THREE.Mesh(new THREE.SphereGeometry(60, 48, 24), new THRE
       float a = acos(clamp(dot(d, u_axis), -1.0, 1.0));
       vec3 top = vec3(0.80, 0.82, 0.90), mid = vec3(0.66, 0.68, 0.79), low = vec3(0.42, 0.42, 0.55);
       vec3 c = mix(mid, top, smoothstep(0.0, 0.6, d.y));
-      c = mix(c, low, smoothstep(0.0, -0.4, d.y));
+      c = mix(c, low, (1.0 - smoothstep(-0.4, 0.0, d.y)));
       c *= 1.0 - 0.18 * smoothstep(0.2, 1.4, a);
       for (int i = 0; i < 4; i++) {
         float age = u_time - u_t0[i];
@@ -3083,7 +3112,7 @@ function updateSplash(b, now, dt) {
         // a faint tick as it lands, a few at most at once
         if (soundOn && actx && now > s.tickAt) {
           s.tickAt = now + 0.03;
-          const f = 1800 + Math.random() * 2200, at = actx.currentTime + 0.005;
+          const f = 1800 + Math.random() * 2200, at = audioNow() + 0.005;
           osc('sine', f, at, 0.03, out(at, Math.min(0.05, 0.012 + 0.01 * d.v.length()), 0.03), f * 0.6);
         }
       }
@@ -3114,7 +3143,7 @@ function updateStrand(b, p, flying) {
     // it snaps: the strand is gone and a few beads fall from where it broke
     p.snapped = true; p.strand.visible = false;
     spawnDrops(b, from.clone().lerp(to, 0.5), V(0, -0.3, 0), 0.2, 3, 0.4);
-    if (soundOn && actx) { const at = actx.currentTime + 0.005; osc('sine', 900, at, 0.05, out(at, 0.05, 0.05), 2400); }
+    if (soundOn && actx) { const at = audioNow() + 0.005; osc('sine', 900, at, 0.05, out(at, 0.05, 0.05), 2400); }
     return;
   }
   const rad = 0.035 * (1 - len / 0.56) + 0.006;
@@ -3256,13 +3285,13 @@ function sqNote(b, note, hitAbs, vel, dur, drumNote) {
     const u = { kick: 0.5, snare: 0.62, floor: 0.2, tomMid: 0.35, tomHi: 0.5, hat: 0.9, hatPedal: 0.85, hatOpen: 0.9, crash: 0.05, ride: 0.98 }[piece] ?? 0.5;
     const vi = SQ.slots[Math.round(u * (SQ.slots.length - 1))];
     pokeAt(b, vi, hitAbs, piece === 'crash' || piece === 'hatOpen' ? 0.25 : 0.06, vel, piece === 'kick' ? 0.75 : 0.36);
-    if (soundOn && actx) { playDrum(piece, hitAbs, vel); squelch(b, actx.currentTime + Math.max(0, hitAbs - nowSec()), vel * 0.5); }
+    if (soundOn && actx) { playDrum(piece, hitAbs, vel); squelch(b, audioNow() + Math.max(0, hitAbs - nowSec()), vel * 0.5); }
     return;
   }
   const d = FX.hold && dur ? dur : null;
   pokeAt(b, slotFor(b, note), hitAbs, d != null ? d : 0.1, vel);
   if (!soundOn || !actx) return;
-  const t = actx.currentTime + Math.max(0, hitAbs - nowSec());
+  const t = audioNow() + Math.max(0, hitAbs - nowSec());
   squelch(b, t, vel);
   if (!kitPlay(note, t, vel, d)) squishVoice(b, note, t, vel, d);
   if (d != null && d > 0.3) pop(t + d, vel, mtof(note) * 0.5);
@@ -3378,7 +3407,7 @@ function updatePieces(b, now) {
 // the vowel opens as the body stretches and closes as it squashes; the pitch bends with the wobble
 function shapeVoices(b) {
   if (!actx) return;
-  const now = actx.currentTime;
+  const now = audioNow();
   b.voices = b.voices.filter(v => now < v.end);
   const open = clamp(0.55 - b.q * 3, 0, 1), bend = clamp(-b.qv * 45, -120, 120);
   for (const v of b.voices) {
@@ -3433,14 +3462,14 @@ canvas.addEventListener('pointermove', e => {
   if (step !== grab.step) {
     grab.step = step;
     const midi = grab.base + 12 * Math.floor(step / 5) + PENTA[step % 5];
-    if (!grab.voice) { squishVoice(grab.b, midi, actx.currentTime + 0.01, 0.7, 30); grab.voice = grab.b.voices[grab.b.voices.length - 1]; }
-    else for (const o of [grab.voice.o1, grab.voice.o2]) o.frequency.setTargetAtTime(mtof(midi) * (o === grab.voice.o2 ? 1.003 : 1), actx.currentTime, 0.04);
+    if (!grab.voice) { squishVoice(grab.b, midi, audioNow() + 0.01, 0.7, 30); grab.voice = grab.b.voices[grab.b.voices.length - 1]; }
+    else for (const o of [grab.voice.o1, grab.voice.o2]) o.frequency.setTargetAtTime(mtof(midi) * (o === grab.voice.o2 ? 1.003 : 1), audioNow(), 0.04);
   }
 }, { capture: true });
 function letGo(e) {
   if (!grab) return;
   if (e) e.stopImmediatePropagation();
-  const b = grab.b, t = actx.currentTime;
+  const b = grab.b, t = audioNow();
   b.pull = null; b.qv -= 1.2; b.heat += 0.6;
   if (grab.voice) {
     const v = grab.voice;
@@ -3531,7 +3560,7 @@ const smBackdrop = new THREE.Mesh(new THREE.SphereGeometry(60, 32, 16), new THRE
   vertexShader: `varying vec3 v_dir; void main () { v_dir = normalize(position); gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
   fragmentShader: `varying vec3 v_dir; void main () {
       vec3 d = normalize(v_dir);
-      vec3 c = mix(vec3(0.10, 0.075, 0.06), vec3(0.22, 0.16, 0.12), smoothstep(-0.1, 0.5, d.y) * smoothstep(1.0, 0.2, abs(d.x)));
+      vec3 c = mix(vec3(0.10, 0.075, 0.06), vec3(0.22, 0.16, 0.12), smoothstep(-0.1, 0.5, d.y) * (1.0 - smoothstep(0.2, 1.0, abs(d.x))));
       gl_FragColor = linearToOutputTexel(vec4(pow(c, vec3(2.2)), 1.0));
     }`,
 }));
@@ -3647,8 +3676,9 @@ const smoke = (() => {
       varying float v_alpha; varying float v_rot;
       void main () {
         vec4 mv = modelViewMatrix * vec4(position, 1.0);
-        gl_PointSize = a_size * u_scale / -mv.z;
-        v_alpha = a_alpha; v_rot = a_rot;
+        // a puff drifting up past the lens would fill the frame, so close ones thin out and none grows past a third of it
+        gl_PointSize = min(a_size * u_scale / max(-mv.z, 0.01), 0.3 * u_scale);
+        v_alpha = a_alpha * smoothstep(0.12, 0.5, -mv.z); v_rot = a_rot;
         gl_Position = projectionMatrix * mv;
       }`,
     fragmentShader: `uniform sampler2D u_tex; varying float v_alpha; varying float v_rot;
@@ -3679,6 +3709,9 @@ function puff(at, vel, n, kick = 1) {
 function updateSmoke(now, dt) {
   const s = smoke;
   s.list = s.list.filter(q => (q.age += dt) < q.life);
+  // a busy song pours from many tips at once; past a few hundred puffs each gets fainter, so the room hazes over
+  // instead of turning into a white wall
+  const crowd = Math.min(1, Math.pow(260 / Math.max(1, s.list.length), 0.8));
   s.list.forEach((q, i) => {
     // buoyant and lazily curling: it rises, wanders sideways and slows as it spreads
     const t = now * 0.7 + q.seed;
@@ -3691,7 +3724,7 @@ function updateSmoke(now, dt) {
     const u = q.age / q.life;
     s.P[i * 3] = q.p.x; s.P[i * 3 + 1] = q.p.y; s.P[i * 3 + 2] = q.p.z;
     s.S[i] = q.size + q.grow * Math.sqrt(q.age);
-    s.A[i] = q.dens * Math.min(1, q.age * 6) * Math.pow(1 - u, 1.6);
+    s.A[i] = crowd * q.dens * Math.min(1, q.age * 6) * Math.pow(1 - u, 1.6);
     s.R[i] = q.rot;
   });
   s.geo.setDrawRange(0, s.list.length);
@@ -3864,14 +3897,14 @@ const smokeMachine = {
     const vel = e.vel / 127, d = FX.hold && e.dur ? e.dur : 0.45;
     smokeNotes.push({ pack: id, note: e.note, t: hitAbs, end: hitAbs + d, vel, h: vary(0.25) });
     if (!soundOn || !actx) return;
-    const t = actx.currentTime + Math.max(0, hitAbs - nowSec()), k = Number(id.slice(1)), n = Math.max(1, packs.length);
+    const t = audioNow() + Math.max(0, hitAbs - nowSec()), k = Number(id.slice(1)), n = Math.max(1, packs.length);
     if (!kitPlay(e.note, t, vel, FX.hold && e.dur ? e.dur : null)) smokeVoice(e.note, t, vel, d, clamp((k - (n - 1) / 2) * 0.5, -0.7, 0.7));
   },
   live(note, vel) {
     if (!packs.length) return false;
     const t = nowSec() + SMOKE_LEAD + 0.05, pack = packs.reduce((m, p) => (Math.abs((p.lo + p.hi) / 2 - note) < Math.abs((m.lo + m.hi) / 2 - note) ? p : m), packs[0]);
     smokeNotes.push({ pack: pack.id, note, t, end: t + 0.6, vel: vel / 127, h: vary(0.25) });
-    if (soundOn && actx && !kitPlay(note, actx.currentTime + SMOKE_LEAD + 0.05, vel / 127, 0.6)) smokeVoice(note, actx.currentTime + SMOKE_LEAD + 0.05, vel / 127, 0.6, 0);
+    if (soundOn && actx && !kitPlay(note, audioNow() + SMOKE_LEAD + 0.05, vel / 127, 0.6)) smokeVoice(note, audioNow() + SMOKE_LEAD + 0.05, vel / 127, 0.6, 0);
     return true;
   },
   update(now, dt) { updatePacks(now, dt); updateSmoke(now, dt); },
@@ -4349,13 +4382,13 @@ const crawlMachine = {
     const vel = e.vel / 127, d = FX.hold && e.dur ? e.dur : null;
     crawlNotes.push({ t: hitAbs, note: e.note, vel });
     if (!soundOn || !actx) return;
-    const t = actx.currentTime + Math.max(0, hitAbs - nowSec());
+    const t = audioNow() + Math.max(0, hitAbs - nowSec());
     if (!kitPlay(e.note, t, vel, d)) marbleTap(e.note, t, vel, d, clamp(crawl.pos.x / 2, -0.7, 0.7));
   },
   live(note, vel) {
     const t = nowSec() + 0.3;
     crawlNotes.push({ t, note, vel: vel / 127 });
-    if (soundOn && actx && !kitPlay(note, actx.currentTime + 0.3, vel / 127, null)) marbleTap(note, actx.currentTime + 0.3, vel / 127, null, 0);
+    if (soundOn && actx && !kitPlay(note, audioNow() + 0.3, vel / 127, null)) marbleTap(note, audioNow() + 0.3, vel / 127, null, 0);
     return true;
   },
   update(now, dt) {
@@ -4605,6 +4638,7 @@ function step(dir, wrap = true) {
   return false;
 }
 function onSongEnd() {
+  if (filmT !== null) return;
   if ($('#autoNext').checked && cur >= 0 && step(1, false)) return;
   setStatus('Finished. Pick another song, or press ] for the next one.');
 }
@@ -4950,7 +4984,7 @@ function renderSound() {
 }
 function previewTake(c) {
   ensureAudio(); soundOn = true; syncSound();
-  const t = actx.currentTime + 0.05;
+  const t = audioNow() + 0.05;
   if (c.type === 'hit') kitHit(kits.mine, c, 60, t, 0.8, 0, true);
   else kitScrape(kits.mine, c, 60, t, 0.8, Math.min(1.5, c.buffer.duration), 0);
 }
@@ -5175,25 +5209,303 @@ function directCamera(now, dt) {
   return true;
 }
 
+
+// ---------- film: the song rendered frame by frame into a video, with its real sound ----------
+// Nothing is screen-recorded. The clock stops following the wall and steps exactly one frame at a time, so a slow
+// frame can't be dropped and every landing sits on its beat. Each frame can take as long as it likes, which buys
+// quality a live page can't afford: ambient occlusion, bigger shadow maps and every frame drawn at twice the size
+// and scaled down. The sound is the same instruments, rendered offline on the same clock, so it can't drift.
+// Randomness is seeded, so the same song on the same machine films the same way twice.
+const FILM_FORMATS = { wide: [1920, 1080, 'Landscape 16:9'], tall: [1080, 1920, 'Vertical 9:16'], square: [1080, 1080, 'Square 1:1'] };
+const FILM = { format: 'wide', fps: 60, hq: !LITE, titles: true };
+try { Object.assign(FILM, JSON.parse(localStorage.getItem('pipeRig.film')) || {}); } catch { /* defaults */ }
+let filmT0 = 0, filmCancel = false, gtao = null;
+function seeded(seed) {
+  return () => { seed |= 0; seed = (seed + 0x6D2B79F5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+}
+// yields to the page without the timer throttling a background tab gets
+const breathe = () => new Promise(r => { const c = new MessageChannel(); c.port1.onmessage = () => r(); c.port2.postMessage(0); });
+async function samplesSettled(ms = 12000) {
+  const end = performance.now() + ms;
+  while (Object.values(sampleBank).some(s => s.state === 'loading') && performance.now() < end) await new Promise(r => setTimeout(r, 100));
+}
+// film quality: ambient occlusion in the corners and contacts, sized to the stage, and sharper shadows
+async function filmQuality(on, W, H) {
+  const lights = [];
+  scene.traverse(o => { if (o.isLight && o.castShadow) lights.push(o); });
+  for (const l of lights) {
+    const want = on ? 4096 : SHADOW_SIZE;
+    if (l.shadow.mapSize.x !== want) { l.shadow.mapSize.set(want, want); if (l.shadow.map) { l.shadow.map.dispose(); l.shadow.map = null; } }
+  }
+  if (!composer) return;
+  if (on) {
+    if (!gtao) {
+      try {
+        const { GTAOPass } = await import('three/addons/postprocessing/GTAOPass.js');
+        gtao = new GTAOPass(scene, camera, W, H);
+      } catch { gtao = false; }
+    }
+    if (gtao) {
+      gtao.updateGtaoMaterial({ radius: clamp(orbit.r * 0.03, 0.04, 0.8), distanceExponent: 1.5, thickness: 1, scale: 1, samples: 16 });
+      gtao.blendIntensity = 0.9;
+      if (!composer.passes.includes(gtao)) composer.insertPass(gtao, 1);
+    }
+  } else if (gtao && composer.passes.includes(gtao)) composer.removePass(gtao);
+}
+function filmSize(W, H) {
+  renderer.setPixelRatio(1);
+  renderer.setSize(W, H, false);
+  camera.aspect = W / H; camera.updateProjectionMatrix();
+  camFit = camera.aspect < 1 ? Math.min(2, Math.pow(1 / camera.aspect, 0.8)) : 1;
+  reflRT.setSize(Math.round(W * 0.6), Math.round(H * 0.6));
+  if (composer) composer.setSize(W, H);
+}
+// the opening title, lower left, for the first few seconds
+function drawTitle(g, w, h, t, entry) {
+  const a = Math.min(clamp((t - 0.4) / 0.6, 0, 1), clamp((5 - t) / 0.8, 0, 1));
+  if (a <= 0) return;
+  const u = Math.min(w, h) / 1080, x = 72 * u, y = h - 96 * u, dark = machine.id === 'doll' || machine.id === 'squish';
+  g.save();
+  g.globalAlpha = a;
+  g.translate(0, (1 - a) * 14 * u);
+  g.fillStyle = dark ? 'rgba(30, 20, 40, 0.9)' : 'rgba(255, 246, 236, 0.95)';
+  g.shadowColor = dark ? 'rgba(255, 255, 255, 0.6)' : 'rgba(0, 0, 0, 0.45)'; g.shadowBlur = 18 * u;
+  g.font = `700 ${Math.round(52 * u)}px "Bricolage Grotesque", system-ui, sans-serif`;
+  g.fillText(entry.name.replace(/\.midi?$/i, '').replace(/[_-]+/g, ' '), x, y);
+  g.font = `500 ${Math.round(24 * u)}px "IBM Plex Mono", ui-monospace, monospace`;
+  g.globalAlpha = a * 0.75;
+  g.fillText(`played by ${machine.label}`, x, y + 40 * u);
+  g.restore();
+}
+/**
+ * Plays the current song on the current machine on a stepped clock.
+ * opts: { w, h, fps, ss (supersampling), hq, sound, draw(i, t) -> should frame i be drawn,
+ *         frame(i, t, picture) after a drawn frame (async), progress(i, n) }
+ * Returns the rendered AudioBuffer when opts.sound, else null.
+ */
+async function shoot(opts) {
+  const entry = current;
+  if (!entry || !entry.notes.length) throw new Error('load a song first');
+  const { w, h, fps, ss = 1, hq = false, sound = true } = opts;
+  ensureAudio();
+  if (sound && FX.samples) { preloadSamples(); await samplesSettled(); }
+  const live = { actx, master, reverbWet, noiseBuf, soundOn, random: Math.random, loop: song ? song.loop : false };
+  filmCancel = false;
+  Math.random = seeded(0x51ed + entry.notes.length);
+  filmT = filmT0 = nowSec();
+  soundOn = false;
+  if (live.actx) live.actx.suspend();
+  const W = Math.round(w * ss), H = Math.round(h * ss);
+  const pic = document.createElement('canvas'); pic.width = w; pic.height = h;
+  const g = pic.getContext('2d');
+  g.imageSmoothingEnabled = true; g.imageSmoothingQuality = 'high';
+  try {
+    filmSize(W, H);
+    await filmQuality(hq, W, H);
+    if (bloomPass) bloomPass.enabled = FX.glow;
+    // a quiet second first, so anything still moving from before settles out of shot
+    song = null;
+    for (let i = 0; i < fps; i++) { filmT += 1 / fps; tick(filmT, 1 / fps, false); }
+    lastTouch = -1e9; director.shot = null;
+    playEntry(entry, false, entry.name);
+    filmT0 = filmT;
+    const total = song.start - filmT0 + song.dur + 2.5, n = Math.ceil(total * fps);
+    // The sound renders alongside the picture, a quarter second at a time and always just behind it. Mixed all at
+    // once at the end, every note of the song would sit in the graph for its whole length, and a busy song holds
+    // thousands of filters: the mix would crawl. This way finished notes drop out as they do live.
+    let mix = null;
+    if (sound) {
+      const sr = live.actx ? live.actx.sampleRate : 48000;
+      buildAudio(new OfflineAudioContext(2, Math.ceil(total * sr), sr));
+      soundOn = true;
+      mix = { ctx: actx, at: 0, held: false, step: 0.25 };
+      for (let k = 1; k * mix.step < total; k++) actx.suspend(k * mix.step).then(() => { mix.at = k * mix.step; mix.held = true; });
+      mix.done = actx.startRendering();
+    }
+    const feed = upTo => { if (mix && mix.held && mix.at + mix.step <= upTo) { mix.held = false; mix.ctx.resume(); } };
+    for (let i = 0; i < n && !filmCancel; i++) {
+      const t = i / fps;
+      filmT = filmT0 + t;
+      const drawIt = !opts.draw || opts.draw(i, t);
+      tick(filmT, 1 / fps, drawIt);
+      feed(t - 0.05);
+      if (drawIt) {
+        g.drawImage(renderer.domElement, 0, 0, w, h);
+        if (opts.titles) drawTitle(g, w, h, t, entry);
+        if (opts.frame) await opts.frame(i, t, pic);
+      }
+      if (opts.progress && (i % 6 === 0 || i === n - 1)) { opts.progress(i + 1, n, mix ? mix.at / total : 0); await breathe(); }
+    }
+    if (filmCancel) throw new Error('cancelled');
+    if (!sound) return null;
+    for (;;) {
+      const done = await Promise.race([mix.done, new Promise(r => setTimeout(r, 15))]);
+      if (done) return done;
+      if (opts.mixing) opts.mixing(mix.at / total);
+      feed(Infinity);
+    }
+  } finally {
+    Math.random = live.random;
+    ({ actx, master, reverbWet, noiseBuf, soundOn } = live);
+    if (actx) actx.resume();
+    filmT = null; last = nowSec();
+    song = null; $('#tSource').textContent = 'Live input';
+    if (bloomPass) bloomPass.enabled = true;
+    await filmQuality(false);
+    resize();
+  }
+}
+
+// ---------- the Film row: record a video file ----------
+async function pickCodec(list, Enc, base) {
+  if (!window[Enc]) return null;
+  for (const c of list) {
+    try { if ((await window[Enc].isConfigSupported({ ...base, ...c })).supported) return { ...base, ...c }; } catch { /* next */ }
+  }
+  return null;
+}
+async function recordFilm() {
+  if (!current || !current.notes.length) { setStatus('Load a song first, then record it.'); return; }
+  if (!window.VideoEncoder) { setStatus('This browser can\'t make video files. Use Chrome or Edge on a computer.'); return; }
+  const [w, h] = FILM_FORMATS[FILM.format], fps = FILM.fps, ss = FILM.hq ? 2 : 1;
+  const ui = $('#filmBox'), bar = $('#filmBar'), note = $('#filmNote'), save = $('#filmSave');
+  ui.hidden = false; save.hidden = true; $('#filmCancel').hidden = false; bar.value = 0;
+  note.textContent = 'Getting ready…';
+  const prev = $('#filmPrev'); prev.width = w; prev.height = h;
+  const pg = prev.getContext('2d');
+  try {
+    const { Muxer, ArrayBufferTarget } = await import('https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.1/build/mp4-muxer.mjs');
+    const vcfg = await pickCodec([{ codec: 'avc1.640033' }, { codec: 'avc1.4d0033' }, { codec: 'avc1.42003e' }], 'VideoEncoder',
+      { width: w, height: h, bitrate: Math.round(w * h * fps * 0.11), framerate: fps, latencyMode: 'quality' });
+    if (!vcfg) throw new Error('this browser has no H.264 encoder');
+    const sr = actx ? actx.sampleRate : 48000;
+    const acfg = await pickCodec([{ codec: 'mp4a.40.2', bitrate: 256000 }, { codec: 'opus', bitrate: 192000 }], 'AudioEncoder', { sampleRate: sr, numberOfChannels: 2 });
+    const target = new ArrayBufferTarget();
+    const muxer = new Muxer({
+      target, fastStart: 'in-memory', firstTimestampBehavior: 'offset',
+      video: { codec: 'avc', width: w, height: h, frameRate: fps },
+      ...(acfg ? { audio: { codec: acfg.codec === 'opus' ? 'opus' : 'aac', numberOfChannels: 2, sampleRate: sr } } : {}),
+    });
+    let failed = null;
+    const venc = new VideoEncoder({ output: (c, m) => muxer.addVideoChunk(c, m), error: e => { failed = e; } });
+    venc.configure(vcfg);
+    const t0 = performance.now();
+    const audio = await shoot({
+      w, h, fps, ss, hq: FILM.hq, titles: FILM.titles, sound: true,
+      frame: async (i, t, pic) => {
+        if (failed) throw failed;
+        const vf = new VideoFrame(pic, { timestamp: Math.round(i * 1e6 / fps), duration: Math.round(1e6 / fps) });
+        venc.encode(vf, { keyFrame: i % (fps * 2) === 0 });
+        vf.close();
+        while (venc.encodeQueueSize > 8) await breathe();
+        if (i % 4 === 0) pg.drawImage(pic, 0, 0);
+      },
+      mixing: f => { note.textContent = `Mixing the sound… ${Math.round(f * 100)}%`; },
+      progress: (i, n, mixed) => {
+        bar.value = i / n;
+        const el = (performance.now() - t0) / 1000, left = el / i * (n - i);
+        note.textContent = `Frame ${i} of ${n} · ${fmt(i / fps)} of ${fmt(n / fps)} · about ${fmt(left)} to go · sound ${Math.round(mixed * 100)}%`;
+      },
+    });
+    note.textContent = 'Finishing the picture…';
+    await venc.flush(); venc.close();
+    if (audio && acfg) {
+      note.textContent = 'Adding the sound…';
+      const aenc = new AudioEncoder({ output: (c, m) => muxer.addAudioChunk(c, m), error: e => { failed = e; } });
+      aenc.configure(acfg);
+      const L = audio.getChannelData(0), R = audio.getChannelData(1), N = 4096;
+      for (let s = 0; s < audio.length; s += N) {
+        const k = Math.min(N, audio.length - s), data = new Float32Array(k * 2);
+        data.set(L.subarray(s, s + k), 0); data.set(R.subarray(s, s + k), k);
+        const ad = new AudioData({ format: 'f32-planar', sampleRate: sr, numberOfFrames: k, numberOfChannels: 2, timestamp: Math.round(s * 1e6 / sr), data });
+        aenc.encode(ad); ad.close();
+        if (aenc.encodeQueueSize > 32) await breathe();
+      }
+      await aenc.flush(); aenc.close();
+    }
+    if (failed) throw failed;
+    muxer.finalize();
+    const url = URL.createObjectURL(new Blob([target.buffer], { type: 'video/mp4' }));
+    const name = `${current.name.replace(/\.midi?$/i, '').replace(/[^\w\- ]+/g, '').trim() || 'song'} - ${machine.label}.mp4`;
+    Object.assign(save, { href: url, download: name, hidden: false });
+    save.textContent = `Save ${name} (${(target.buffer.byteLength / 1e6).toFixed(0)} MB)`;
+    save.click();
+    $('#filmCancel').hidden = true;
+    note.textContent = `Done in ${fmt((performance.now() - t0) / 1000)}.` + (acfg ? '' : ' This browser can\'t encode sound, so the video is silent.');
+    setStatus(`Recorded ${name}.`);
+  } catch (err) {
+    note.textContent = err.message === 'cancelled' ? 'Cancelled.' : `The recording stopped: ${err.message}.`;
+    $('#filmCancel').hidden = true;
+  }
+}
+{
+  const fmtSel = $('#filmFormat'), fpsSel = $('#filmFps');
+  for (const [k, [, , label]] of Object.entries(FILM_FORMATS)) fmtSel.add(new Option(label, k));
+  fmtSel.value = FILM.format; fpsSel.value = String(FILM.fps);
+  $('#filmHq').checked = FILM.hq; $('#filmTitles').checked = FILM.titles;
+  const keep = () => { try { localStorage.setItem('pipeRig.film', JSON.stringify(FILM)); } catch { /* this visit only */ } };
+  fmtSel.onchange = () => { FILM.format = fmtSel.value; keep(); };
+  fpsSel.onchange = () => { FILM.fps = +fpsSel.value; keep(); };
+  $('#filmHq').onchange = e => { FILM.hq = e.target.checked; keep(); };
+  $('#filmTitles').onchange = e => { FILM.titles = e.target.checked; keep(); };
+  $('#filmBtn').onclick = recordFilm;
+  $('#filmCancel').onclick = () => { filmCancel = true; };
+  $('#filmClose').onclick = () => { filmCancel = true; $('#filmBox').hidden = true; };
+}
+// review sheets: stills at chosen song times, tiled and labelled, the same frames the film would hold
+window.pipeFilm = {
+  async sheet(times, { w = 960, h = 540, cols = 4, hq = true } = {}) {
+    const want = times.map(t => Math.round(t * 60));
+    const tw = Math.round(w / 2), th = Math.round(h / 2), rows = Math.ceil(times.length / cols);
+    const sheet = document.createElement('canvas'); sheet.width = cols * tw; sheet.height = rows * th;
+    const sg = sheet.getContext('2d');
+    sg.fillStyle = '#333'; sg.fillRect(0, 0, sheet.width, sheet.height);
+    let k = 0;
+    await shoot({
+      w, h, fps: 60, ss: hq ? 2 : 1, hq, sound: false, titles: false,
+      draw: i => want.includes(i),
+      frame: (i, t, pic) => {
+        for (let j = 0; j < want.length; j++) if (want[j] === i) {
+          const x = (j % cols) * tw, y = Math.floor(j / cols) * th;
+          sg.drawImage(pic, x, y, tw - 2, th - 2);
+          sg.fillStyle = 'rgba(0,0,0,0.65)'; sg.fillRect(x + 4, y + 4, 96, 24);
+          sg.fillStyle = '#fff'; sg.font = '600 16px monospace'; sg.fillText(`t=${t.toFixed(2)}`, x + 10, y + 22);
+          k++;
+        }
+        if (k >= want.length) filmCancel = true;
+      },
+    }).catch(err => { if (err.message !== 'cancelled') throw err; });
+    return sheet.toDataURL('image/png');
+  },
+  // the song times its notes land on (seconds from the start of the film)
+  beats() { return song ? song.entry.notes.map(e => song.start - filmT0 + e.time) : current ? current.notes.map(e => e.time) : []; },
+};
+
 // ---------- loop ----------
 let last = nowSec(), hudT = 0;
-function frame() {
-  const now = nowSec(), dt = Math.min(0.05, now - last); last = now;
+function tick(now, dt, draw = true) {
   pumpSong(now);
   updateGroove(now, dt);
   machine.update(now, dt);
   updateHitLights(now);
   if (!directCamera(now, dt) && !reduceMotion && !drag && now - lastTouch > 5) orbit.theta += dt * 0.03;
   placeCam();
+  if (!draw) return;
   if (machine.beforeRender) machine.beforeRender();
-  if (FX.glow && composer) renderGlow(); else renderer.render(scene, camera);
+  // a film always goes through the composer: its ambient occlusion lives there
+  if (composer && (FX.glow || filmT !== null)) renderGlow(); else renderer.render(scene, camera);
+}
+function frame() {
+  requestAnimationFrame(frame);
+  if (filmT !== null) return;
+  const now = nowSec(), dt = Math.min(0.05, now - last); last = now;
+  tick(now, dt);
   if (now - hudT > 0.15) {
     hudT = now;
     $('#tClock').textContent = song ? fmt(now - song.start) + ' / ' + fmt(song.dur) : '—';
     $('#tFlight').textContent = machine.inFlight();
     $('#tHits').textContent = machine.hits();
   }
-  requestAnimationFrame(frame);
 }
 resize();
 if (matchMedia('(max-width: 560px)').matches) { $('#console').hidden = true; $('#showPanel').hidden = false; }
