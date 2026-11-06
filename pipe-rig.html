@@ -101,6 +101,8 @@ body[data-machine="doll"] .hud p, body[data-machine="doll"] .telemetry, body[dat
 body[data-machine="doll"] .hud h1 { color: #d81b72; }
 body[data-machine="squish"] .hud p, body[data-machine="squish"] .telemetry, body[data-machine="squish"] .telemetry span b { color: #2b2746; }
 body[data-machine="squish"] .hud h1 { color: #4a2bb8; }
+body[data-machine="octo"] .hud p, body[data-machine="octo"] .telemetry, body[data-machine="octo"] .telemetry span b { color: #3a3630; }
+body[data-machine="octo"] .hud h1 { color: #e0431a; }
 body[data-machine="squish"] .hud { text-shadow: 0 0 8px rgba(255, 255, 255, 0.85), 0 0 2px rgba(255, 255, 255, 0.9); }
 .dial { display: inline-flex; align-items: center; gap: 8px; font-size: 0.8rem; color: var(--muted); }
 .dial input { width: 110px; accent-color: var(--copper); }
@@ -161,6 +163,7 @@ body.dropping #stage { outline: 3px dashed var(--copper); outline-offset: -12px;
       <button data-m="squish" aria-pressed="false">Squish</button>
       <button data-m="smokes" aria-pressed="false">Smokes</button>
       <button data-m="hand" aria-pressed="false">Crawling Hand</button>
+      <button data-m="octo" aria-pressed="false">Octopus</button>
     </span>
   </div>
   <div class="row">
@@ -226,7 +229,7 @@ body.dropping #stage { outline: 3px dashed var(--copper); outline-offset: -12px;
     <span class="label">Film</span>
     <label class="dial" for="filmFormat">Shape <select id="filmFormat"></select></label>
     <label class="dial" for="filmFps">Frames <select id="filmFps"><option value="60">60 fps</option><option value="30">30 fps</option></select></label>
-    <label class="check" title="Ambient occlusion, sharper shadows and every frame drawn at twice the size: slower to record, better looking"><input type="checkbox" id="filmHq"> Film quality</label>
+    <label class="check" title="Ambient occlusion, sharper shadows and every frame drawn at 1.5 times the size: slower to record, better looking"><input type="checkbox" id="filmHq"> Film quality</label>
     <label class="check"><input type="checkbox" id="filmTitles"> Title</label>
     <button id="filmBtn" class="primary" title="Render the current song on this machine, frame by frame, into a video file with its sound">Record video</button>
   </div>
@@ -4451,7 +4454,444 @@ function renderCrawlParts(entry) {
   $('#partSummary').textContent = `${entry.parts.length} part${entry.parts.length > 1 ? 's' : ''}: ${n} stepped by the hand (click to change)`;
 }
 
-const MACHINES = { pipe: pipeMachine, doll: dollMachine, squish: squishMachine, smokes: smokeMachine, hand: crawlMachine };
+
+// ---------- octopus: a white robot octopus whose eight arms whip down onto the floor on the beat ----------
+// Everything is built from code. Each arm is a chain of links that shrink toward the tip, with two rows of
+// wheels along the inside, and one number, its curl, poses all of it: every link bends a little more than the
+// one before, so the tip rolls up into a true spiral. A note winds the arm up, whips it out flat so the tip
+// slaps the floor exactly on the beat, and lets it spring back into its curl, a ripple running down the links.
+const octoWorld = new THREE.Group();
+octoWorld.visible = false;
+scene.add(octoWorld);
+const OCTO_BG = new THREE.Color(0xe9e5df);
+// a pale seamless studio; the fog is the wall's color at the horizon, in linear terms, so the floor runs into it
+const OC_HORIZON = [0.93, 0.91, 0.88], OCTO_FOG = new THREE.Fog(new THREE.Color(...OC_HORIZON.map(v => Math.pow(v, 2.2))), 7, 24);
+const ocBackdrop = new THREE.Mesh(new THREE.SphereGeometry(60, 32, 16), new THREE.ShaderMaterial({
+  side: THREE.BackSide, depthWrite: false,
+  vertexShader: `varying vec3 v_dir; void main () { v_dir = normalize(position); gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+  fragmentShader: `varying vec3 v_dir; void main () {
+      vec3 d = normalize(v_dir);
+      vec3 c = mix(vec3(0.93, 0.91, 0.88), vec3(0.98, 0.97, 0.95), smoothstep(0.0, 0.7, d.y));
+      gl_FragColor = linearToOutputTexel(vec4(pow(c, vec3(2.2)), 1.0));
+    }`,
+}));
+octoWorld.add(ocBackdrop);
+const ocFloor = new THREE.Mesh(new THREE.CircleGeometry(40, 96), new THREE.MeshStandardMaterial({ color: new THREE.Color(...OC_HORIZON.map(v => 0.6 * Math.pow(v, 2.2))), roughness: 0.75, metalness: 0 }));
+ocFloor.material.userData.envBase = 0.1;
+ocFloor.rotation.x = -Math.PI / 2; ocFloor.receiveShadow = true;
+octoWorld.add(ocFloor);
+const ocHemi = new THREE.HemisphereLight(0xffffff, 0xd9cfc4, 0.35 * LI);
+const ocKey = new THREE.DirectionalLight(0xfff6ec, 1.0 * LI);
+ocKey.position.set(2.5, 6, 3.5); ocKey.castShadow = true;
+ocKey.shadow.mapSize.set(SHADOW_SIZE, SHADOW_SIZE); ocKey.shadow.bias = -0.0004; ocKey.shadow.normalBias = 0.02;
+Object.assign(ocKey.shadow.camera, { left: -3.5, right: 3.5, top: 3.5, bottom: -3.5, near: 0.5, far: 20 });
+const ocFill = new THREE.DirectionalLight(0xe6eeff, 0.25 * LI);
+ocFill.position.set(-4, 2.5, 1.5);
+const ocRim = new THREE.DirectionalLight(0xffffff, 0.5 * LI);
+ocRim.position.set(-1, 3, -5);
+octoWorld.add(ocHemi, ocKey, ocKey.target, ocFill, ocRim);
+
+// ---------- surfaces: painted detail, so every link and petal carries seams, rivets and plates ----------
+// colors here are linear, so the picked sRGB values are converted on the way in
+const OC_ORANGE = new THREE.Color(0xf04a1e).convertSRGBToLinear(), OC_WHITE = new THREE.Color(0xf4f1ec).convertSRGBToLinear(), OC_DARK = new THREE.Color(0x2a2c31).convertSRGBToLinear();
+const ocRnd = seeded(0x0c70);
+function ocDots(x, w, h, n, r0, r1) {
+  for (let i = 0; i < n; i++) { x.beginPath(); x.arc(ocRnd() * w, ocRnd() * h, r0 + ocRnd() * (r1 - r0), 0, 2 * Math.PI); x.fill(); }
+}
+// the mantle: eight petals parted by seams, rivets along every seam, a few orange plates and dark vents
+const ocShellTex = canvasTex(2048, 1024, (x, w, h) => {
+  x.fillStyle = '#f4f1ec'; x.fillRect(0, 0, w, h);
+  for (let k = 0; k < 8; k++) {
+    const u = (k + 0.5) / 8 * w;
+    x.fillStyle = '#3a3c40'; x.fillRect(u - 2, 0, 4, h);
+    x.fillStyle = '#1c1d20';
+    for (let v = 40; v < h; v += 30) for (const s of [-1, 1]) { x.beginPath(); x.arc(u + s * 18, v, 5, 0, 2 * Math.PI); x.fill(); }
+    const pu = u + w / 16;
+    x.fillStyle = '#ff4b1f'; x.fillRect(pu - 40 + ocRnd() * 30, h * (0.35 + ocRnd() * 0.25), 44, 22);
+    x.fillStyle = '#26282c'; x.fillRect(pu - 20, h * (0.62 + ocRnd() * 0.1), 40, 8);
+    x.fillStyle = '#1c1d20'; for (let i = 0; i < 16; i++) { x.beginPath(); x.arc(pu + (ocRnd() - 0.5) * 200, h * (0.12 + ocRnd() * 0.7), 4 + ocRnd() * 5, 0, 2 * Math.PI); x.fill(); }
+  }
+  for (const v of [0.3, 0.58]) { x.fillStyle = '#3a3c40'; x.fillRect(0, v * h, w, 3); }
+});
+const ocShellBump = canvasTex(1024, 512, (x, w, h) => {
+  x.fillStyle = '#fff'; x.fillRect(0, 0, w, h);
+  x.fillStyle = '#000';
+  for (let k = 0; k < 8; k++) { const u = (k + 0.5) / 8 * w; x.fillRect(u - 2, 0, 4, h); for (let v = 20; v < h; v += 13) for (const s of [-1, 1]) { x.beginPath(); x.arc(u + s * 8, v, 2, 0, 2 * Math.PI); x.fill(); } }
+  for (const v of [0.3, 0.58]) x.fillRect(0, v * h, w, 3);
+});
+// a link: seam rings near both ends, scattered rivets, an orange tag and a dark vent
+const ocLinkTex = canvasTex(512, 256, (x, w, h) => {
+  x.fillStyle = '#f4f1ec'; x.fillRect(0, 0, w, h);
+  x.fillStyle = '#3a3c40'; x.fillRect(0, 18, w, 3); x.fillRect(0, h - 21, w, 3);
+  x.fillStyle = '#1c1d20'; ocDots(x, w, h - 60, 22, 3.5, 6);
+  x.fillStyle = '#ff4b1f'; x.fillRect(w * 0.15, h * 0.45, 46, 16); x.fillRect(w * 0.66, h * 0.3, 18, 30);
+  x.fillStyle = '#26282c'; x.fillRect(w * 0.42, h * 0.62, 60, 9);
+});
+ocLinkTex.wrapS = THREE.RepeatWrapping;
+const ocLinkBump = canvasTex(256, 128, (x, w, h) => {
+  x.fillStyle = '#fff'; x.fillRect(0, 0, w, h);
+  x.fillStyle = '#000'; x.fillRect(0, 9, w, 2); x.fillRect(0, h - 11, w, 2);
+});
+// the joint between links: a dark sleeve wound with a spring
+const ocSpringTex = canvasTex(64, 256, (x, w, h) => {
+  x.fillStyle = '#1e2024'; x.fillRect(0, 0, w, h);
+  for (let y = 0; y < h; y += 16) { x.fillStyle = '#6a6d74'; x.fillRect(0, y, w, 6); x.fillStyle = '#9a9ea6'; x.fillRect(0, y + 1, w, 2); }
+});
+// the lens: a machined iris, black glass over a grey gear ring
+const ocIrisTex = canvasTex(512, 512, (x, w) => {
+  const c = w / 2;
+  x.fillStyle = '#060607'; x.fillRect(0, 0, w, w);
+  x.fillStyle = '#2b2d33'; x.beginPath(); x.arc(c, c, w * 0.42, 0, 2 * Math.PI); x.fill();
+  x.fillStyle = '#060607'; x.beginPath(); x.arc(c, c, w * 0.34, 0, 2 * Math.PI); x.fill();
+  x.fillStyle = '#3c3f47';
+  for (let k = 0; k < 18; k++) { x.save(); x.translate(c, c); x.rotate(k / 18 * 2 * Math.PI); x.fillRect(-9, -w * 0.43, 18, 26); x.restore(); }
+  x.strokeStyle = '#4a4e57'; x.lineWidth = 5; x.beginPath(); x.arc(c, c, w * 0.22, 0, 2 * Math.PI); x.stroke();
+  x.fillStyle = '#121317'; x.beginPath(); x.arc(c, c, w * 0.12, 0, 2 * Math.PI); x.fill();
+});
+const ocWhiteMat = new THREE.MeshPhysicalMaterial({ color: OC_WHITE, userData: { envBase: 0.55 }, map: ocShellTex, bumpMap: ocShellBump, bumpScale: 1.2, roughness: 0.34, clearcoat: 0.7, clearcoatRoughness: 0.18 });
+const ocLinkMat = new THREE.MeshPhysicalMaterial({ color: OC_WHITE, userData: { envBase: 0.55 }, map: ocLinkTex, bumpMap: ocLinkBump, bumpScale: 1.2, roughness: 0.34, clearcoat: 0.7, clearcoatRoughness: 0.18 });
+const ocPlainMat = new THREE.MeshPhysicalMaterial({ color: OC_WHITE, userData: { envBase: 0.55 }, roughness: 0.34, clearcoat: 0.7, clearcoatRoughness: 0.18 });
+const ocDarkMat = new THREE.MeshStandardMaterial({ color: OC_DARK, roughness: 0.42, metalness: 0.55 });
+const ocSpringMat = new THREE.MeshStandardMaterial({ color: 0xffffff, map: ocSpringTex, roughness: 0.4, metalness: 0.6 });
+const ocOrangeMat = new THREE.MeshPhysicalMaterial({ color: OC_ORANGE, roughness: 0.35, clearcoat: 0.5 });
+const ocTireMat = new THREE.MeshStandardMaterial({ color: new THREE.Color(0x1a1b1f).convertSRGBToLinear(), roughness: 0.55, metalness: 0.1 });
+
+// ---------- the body: mantle, underbody, bands, cap and two optics ----------
+const OC = { R: 0.46, Y: 1.1, N: 16, L0: 0.19, LR: 0.935, R0: 0.098, RR: 0.945, ARMS: 8 };
+const ocBody = new THREE.Group();
+ocBody.position.y = OC.Y;
+octoWorld.add(ocBody);
+{
+  const shell = new THREE.Mesh(new THREE.SphereGeometry(OC.R, 96, 64, 0, 2 * Math.PI, 0, 0.64 * Math.PI), ocWhiteMat);
+  shell.scale.y = 1.06;
+  const under = new THREE.Mesh(new THREE.SphereGeometry(OC.R * 0.94, 64, 32, 0, 2 * Math.PI, 0.5 * Math.PI, 0.5 * Math.PI), ocDarkMat);
+  const lip = Math.sin(0.64 * Math.PI) * OC.R, lipY = Math.cos(0.64 * Math.PI) * OC.R * 1.06;
+  const band = new THREE.Mesh(new THREE.TorusGeometry(lip, 0.018, 16, 128), ocDarkMat);
+  band.rotation.x = Math.PI / 2; band.position.y = lipY;
+  const seam = new THREE.Mesh(new THREE.TorusGeometry(OC.R * 1.003, 0.008, 12, 128), ocDarkMat);
+  seam.rotation.x = Math.PI / 2; seam.position.y = -0.02;
+  const cap = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.09, 0.05, 40), ocDarkMat);
+  cap.position.y = OC.R * 1.06 + 0.005;
+  const capTop = new THREE.Mesh(new THREE.CylinderGeometry(0.045, 0.045, 0.012, 40), ocOrangeMat);
+  capTop.position.y = OC.R * 1.06 + 0.035;
+  for (const m of [shell, under, band, seam, cap, capTop]) { m.castShadow = true; m.receiveShadow = true; ocBody.add(m); }
+}
+const ocEyes = [-1, 1].map(side => {
+  const yaw = side * 0.46, pitch = -0.08;
+  const dir = V(Math.sin(yaw) * Math.cos(pitch), Math.sin(pitch), Math.cos(yaw) * Math.cos(pitch));
+  const g = new THREE.Group();
+  g.position.copy(dir).multiplyScalar(OC.R * 0.9);
+  g.lookAt(g.position.clone().add(dir));
+  const housing = new THREE.Mesh(new THREE.CylinderGeometry(0.175, 0.2, 0.16, 56).rotateX(Math.PI / 2), ocPlainMat);
+  const ring = new THREE.Mesh(new THREE.TorusGeometry(0.13, 0.011, 16, 72), ocOrangeMat);
+  ring.position.z = 0.088;
+  const bezel = new THREE.Mesh(new THREE.TorusGeometry(0.106, 0.012, 12, 72), ocDarkMat);
+  bezel.position.z = 0.086;
+  const look = new THREE.Group();
+  look.position.z = 0.083;
+  const iris = new THREE.Mesh(new THREE.CircleGeometry(0.104, 56), new THREE.MeshStandardMaterial({ map: ocIrisTex, roughness: 0.35, metalness: 0.6, userData: { envBase: 0.6 } }));
+  const dome = new THREE.Mesh(new THREE.SphereGeometry(0.104, 48, 24, 0, 2 * Math.PI, 0, Math.PI / 2).rotateX(Math.PI / 2),
+    new THREE.MeshPhysicalMaterial({ color: 0x020203, roughness: 0.04, clearcoat: 1, clearcoatRoughness: 0.02, transparent: true, opacity: 0.5, userData: { envBase: 0.15 } }));
+  dome.scale.z = 0.45;
+  look.add(iris, dome);
+  for (const m of [housing, ring, bezel]) { m.castShadow = true; g.add(m); }
+  g.add(look);
+  ocBody.add(g);
+  return { g, look, iris, gaze: V(0, 0, 1) };
+});
+
+// ---------- the arms: instanced links, joints, stripes and two rows of wheels ----------
+const ocLinkGeo = new THREE.CylinderGeometry(0.95, 1, 1, 40, 1);
+const ocJointGeo = new THREE.CylinderGeometry(1, 1, 1, 24, 1);
+const ocStripeGeo = new THREE.CylinderGeometry(1, 1, 1, 40, 1, true);
+const ocTireGeo = new THREE.CylinderGeometry(1, 1, 1, 24).rotateZ(Math.PI / 2);   // its axle along x
+const ocHubGeo = new THREE.CylinderGeometry(1, 1, 1, 20).rotateZ(Math.PI / 2);
+const OC_LINKS = OC.ARMS * OC.N;
+const ocInst = {
+  link: new THREE.InstancedMesh(ocLinkGeo, ocLinkMat, OC_LINKS),
+  joint: new THREE.InstancedMesh(ocJointGeo, ocSpringMat, OC_LINKS),
+  stripe: new THREE.InstancedMesh(ocStripeGeo, ocOrangeMat, OC_LINKS),
+  tire: new THREE.InstancedMesh(ocTireGeo, ocOrangeMat, OC_LINKS * 4),
+  hub: new THREE.InstancedMesh(ocHubGeo, ocTireMat, OC_LINKS * 4),
+};
+for (const m of Object.values(ocInst)) { m.castShadow = true; m.receiveShadow = true; m.frustumCulled = false; m.instanceMatrix.setUsage(THREE.DynamicDrawUsage); octoWorld.add(m); }
+// per link: its length, radius, how much of the curl it takes (more toward the tip), and a turn of its paint
+const OC_LEN = [], OC_RAD = [], OC_W = [];
+for (let k = 0; k < OC.N; k++) {
+  OC_LEN.push(OC.L0 * Math.pow(OC.LR, k)); OC_RAD.push(OC.R0 * Math.pow(OC.RR, k));
+  OC_W.push(0.04 + 1.05 * Math.pow((k + 1) / OC.N, 1.7));
+}
+const OC_ROOT = { r: OC.R * 0.6, y: -OC.R * 0.66 };
+const OC_REST = { curl: -0.9, phi: 0.55 }, OC_STRIKE = { curl: 0.16, phi: -0.9, k: OC.N };
+const ocArms = Array.from({ length: OC.ARMS }, (_, i) => {
+  const a = (i + 0.5) / OC.ARMS * 2 * Math.PI;
+  const out = V(Math.sin(a), 0, Math.cos(a));
+  const collar = new THREE.Mesh(new THREE.CylinderGeometry(OC.R0 * 1.25, OC.R0 * 1.45, 0.07, 32), ocDarkMat);
+  collar.castShadow = true; ocBody.add(collar);
+  return {
+    i, a, out, axis: new THREE.Vector3().crossVectors(out, V(0, 1, 0)).normalize(), collar,
+    J: Array.from({ length: OC.N + 1 }, () => V(0, 0, 0)), D: Array.from({ length: OC.N }, () => V(0, 0, 0)), X: Array.from({ length: OC.N }, () => V(0, 0, 0)),
+    roll: Array.from({ length: OC.N }, () => ocRnd() * Math.PI * 2),
+    rest: i === 0 || i === 7 ? -1.15 : OC_REST.phi + (i % 2 ? -0.3 : 0.12) + (ocRnd() - 0.5) * 0.16, restCurl: i === 0 || i === 7 ? -0.28 : OC_REST.curl, notes: [], kicks: [], heat: 0, last: -10, s: 0,
+  };
+});
+const ocM = new THREE.Matrix4(), ocQ = new THREE.Quaternion(), ocS = V(1, 1, 1), ocP = V(0, 0, 0);
+const ocBx = V(0, 0, 0), ocBy = V(0, 0, 0), ocBz = V(0, 0, 0), ocTmp = V(0, 0, 0), ocUp = V(0, 1, 0);
+// poses one arm from its curl and its root angle: each link turns by the curl times its share, so the bend
+// tightens toward the tip; sway leans the arm's plane sideways a little more at every link
+function ocPose(arm, curl, phi, sway, wob) {
+  const root = arm.J[0];
+  root.copy(arm.out).multiplyScalar(OC_ROOT.r).add(ocBody.position); root.y += OC_ROOT.y;
+  let ph = phi;
+  for (let k = 0; k < OC.N; k++) {
+    ph += curl * OC_W[k] + (wob ? wob[k] : 0);
+    const yaw = sway * Math.pow((k + 1) / OC.N, 2), c = Math.cos(yaw), s = Math.sin(yaw);
+    const ox = arm.out.x * c + arm.out.z * s, oz = -arm.out.x * s + arm.out.z * c;
+    arm.D[k].set(ox * Math.cos(ph), Math.sin(ph), oz * Math.cos(ph));
+    arm.X[k].set(arm.axis.x * c + arm.axis.z * s, 0, -arm.axis.x * s + arm.axis.z * c);
+    arm.J[k + 1].copy(arm.J[k]).addScaledVector(arm.D[k], OC_LEN[k]);
+  }
+}
+// the root angle that puts the tip on the floor when the arm is flung out flat, found once by bisection
+{
+  const arm = ocArms[0];
+  let lo = -1.6, hi = 0;
+  for (let it = 0; it < 30; it++) {
+    const mid = (lo + hi) / 2;
+    ocPose(arm, OC_STRIKE.curl, mid, 0, null);
+    // flung out, the arm sags and then lifts at the very end, so the lowest link is what meets the floor
+    let low = 1e9;
+    for (let k = 1; k <= OC.N; k++) { const y = arm.J[k].y - OC_RAD[k - 1]; if (y < low) { low = y; OC_STRIKE.k = k; } }
+    if (low > 0.004) hi = mid; else lo = mid;
+  }
+  OC_STRIKE.phi = (lo + hi) / 2;
+}
+function ocBasis(arm, k) {
+  ocBy.copy(arm.D[k]);
+  ocBx.copy(arm.X[k]).addScaledVector(ocBy, -arm.X[k].dot(ocBy)).normalize();
+  ocBz.crossVectors(ocBx, ocBy);   // kept right-handed: a mirrored instance would draw inside out
+}
+function ocPlace(mesh, idx, pos, sx, sy, sz, roll) {
+  if (roll) {
+    const c = Math.cos(roll), s = Math.sin(roll);
+    ocTmp.copy(ocBx).multiplyScalar(c).addScaledVector(ocBz, s);
+    ocM.makeBasis(ocTmp, ocBy, ocTmp.clone().cross(ocBy));
+  } else ocM.makeBasis(ocBx, ocBy, ocBz);
+  ocM.scale(ocS.set(sx, sy, sz)).setPosition(pos);
+  mesh.setMatrixAt(idx, ocM);
+}
+function ocDraw() {
+  for (const arm of ocArms) {
+    for (let k = 0; k < OC.N; k++) {
+      const id = arm.i * OC.N + k, L = OC_LEN[k], r = OC_RAD[k];
+      ocBasis(arm, k);
+      ocP.copy(arm.J[k]).addScaledVector(ocBy, L * 0.5);
+      ocPlace(ocInst.link, id, ocP, r, L * 0.86, r, arm.roll[k]);
+      ocPlace(ocInst.stripe, id, ocTmp.copy(ocP).addScaledVector(ocBy, L * 0.24), k % 3 === 1 ? r * 1.012 : 0, L * 0.07, r * 1.012, 0);
+      ocPlace(ocInst.joint, id, arm.J[k + 1], r * 0.62, L * 0.2, r * 0.62, 0);
+      let w = id * 4;
+      for (const side of [-1, 1]) for (const along of [-0.22, 0.22]) {
+        const wr = r * 0.44;
+        // -z is the underside: inside the hanging curl, and facing the floor in a slap
+        ocTmp.copy(ocP).addScaledVector(ocBz, -r * 0.42).addScaledVector(ocBx, side * r * 0.92).addScaledVector(ocBy, along * L);
+        ocPlace(ocInst.tire, w, ocTmp, r * 0.24, wr, wr, 0);
+        ocPlace(ocInst.hub, w++, ocTmp.addScaledVector(ocBx, side * r * 0.06), r * 0.26, wr * 0.5, wr * 0.5, 0);
+      }
+    }
+    arm.collar.position.copy(arm.out).multiplyScalar(OC_ROOT.r); arm.collar.position.y = OC_ROOT.y;
+    arm.collar.quaternion.setFromUnitVectors(ocUp, arm.D[0]);
+  }
+  for (const m of Object.values(ocInst)) m.instanceMatrix.needsUpdate = true;
+}
+
+// ---------- notes: wind up, whip out, slap the floor on the beat, spring back ----------
+const OC_WINDUP = 0.42, OC_WHIP = 0.17, OC_LEAD = 0.5;
+let octoHits = 0;
+const ocRipples = Array.from({ length: 24 }, () => {
+  const m = new THREE.Mesh(new THREE.RingGeometry(0.82, 1, 64), new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false, color: 0xffffff }));
+  m.rotation.x = -Math.PI / 2; m.position.y = 0.004; m.renderOrder = 1; octoWorld.add(m);
+  return { m, t0: -10, vel: 0 };
+});
+let ocRippleIdx = 0;
+function ocRipple(pos, color, vel, now) {
+  const r = ocRipples[ocRippleIdx++ % ocRipples.length];
+  r.m.position.set(pos.x, 0.004 + 0.0004 * (ocRippleIdx % 8), pos.z); r.m.material.color.copy(color);
+  r.t0 = now; r.vel = vel;
+}
+// a rubbery knock as the tip lands
+function octoTap(t, vel) {
+  const g = out(t, 0.12 * vel, 0.09);
+  osc('sine', 150, t, 0.09, g, 70);
+  const bp = filt('bandpass', 1400, 1.4), gn = out(t, 0.05 * vel, 0.03);
+  bp.connect(gn); noise(t, 0.03, bp);
+}
+// how far each arm is flung out (s), wound up (w) and rebounding (b) at this moment, from its notes
+function ocStrike(arm, now) {
+  let s = 0, w = 0, b = 0, next = null, prev = null;
+  for (const n of arm.notes) {
+    if (n.t <= now) { if (!prev || n.t > prev.t) prev = n; } else if (!next || n.t < next.t) next = n;
+    const whip0 = n.t - OC_WHIP;
+    if (now >= whip0 && now < n.t) { const u = (now - whip0) / OC_WHIP; s = Math.max(s, u * u * (1.6 - 0.6 * u)); }
+    else if (now >= n.t) {
+      const tau = now - Math.max(n.t, n.end);
+      s = Math.max(s, tau <= 0 ? 1 : Math.exp(-tau * 7));
+    }
+  }
+  if (prev) { const tau = now - Math.max(prev.t, prev.end); if (tau > 0) b = Math.sin(tau * 9) * Math.exp(-tau * 4) * 0.35 * prev.vel; }
+  if (next) {
+    const w0 = Math.max(next.t - OC_WINDUP, prev ? prev.t + 0.06 : -1e9), w1 = next.t - OC_WHIP;
+    if (now >= w0 && now < w1) { const u = (now - w0) / Math.max(0.01, w1 - w0); w = u * u * (3 - 2 * u); }
+    else if (now >= w1) w = 1 - (now - w1) / OC_WHIP;
+    w *= 1 - s;
+  }
+  return { s, w, b };
+}
+const ocWob = new Float32Array(OC.N);
+function updateOcto(now, dt) {
+  let bodyKick = 0, lookAt = null, lookT = -1e9;
+  for (const arm of ocArms) {
+    arm.notes = arm.notes.filter(n => now < Math.max(n.t, n.end) + 1.5);
+    arm.kicks = arm.kicks.filter(k => now < k.t + 1.6);
+    for (const n of arm.notes) if (!n.hit && now >= n.t) {
+      n.hit = true; octoHits++; arm.heat += n.vel; grooveHit(n.vel);
+      arm.kicks.push({ t: n.t, vel: n.vel });
+      ocRipple(arm.J[OC_STRIKE.k], n.color, n.vel, n.t);
+      flashAt(ocTmp.copy(arm.J[OC_STRIKE.k]).setY(0.08), n.color, n.vel * 0.5, 1.4, 7, 0.5);
+    }
+    arm.heat *= Math.exp(-dt * 0.7);
+    const { s, w, b } = ocStrike(arm, now);
+    arm.s = s;
+    // a ripple runs down the links after each slap, growing toward the tip
+    ocWob.fill(0);
+    for (const kk of arm.kicks) {
+      const tau = now - kk.t;
+      if (tau < 0) continue;
+      bodyKick += kk.vel * Math.exp(-tau * 6);
+      for (let k = 0; k < OC.N; k++) ocWob[k] += kk.vel * 0.05 * Math.exp(-tau * 4.5) * Math.sin(16 * tau - k * 0.55) * ((k + 1) / OC.N);
+    }
+    const breathe = 0.05 * Math.sin(now * 0.9 + arm.i * 0.8) * grooveAmt();
+    const curl = arm.restCurl + (OC_STRIKE.curl - arm.restCurl) * s - 0.16 * w - b + breathe;
+    const phi = arm.rest + (OC_STRIKE.phi - arm.rest) * s + 0.32 * w;
+    const sway = 0.3 * Math.sin(now * 0.37 + arm.i * 1.7);
+    ocPose(arm, curl, phi, sway, ocWob);
+    const last = arm.notes.reduce((m, n) => (n.t <= now + 0.3 && (!m || n.t > m.t) ? n : m), null);
+    if (last && last.t > lookT) { lookT = last.t; lookAt = arm.J[OC.N]; }
+  }
+  // the body hovers, bobs and dips a little under every slap
+  ocBody.position.y = OC.Y + 0.025 * Math.sin(now * 1.3) - 0.035 * Math.min(1.5, bodyKick);
+  ocBody.rotation.set(0.03 * Math.sin(now * 0.7), 0.06 * Math.sin(now * 0.23), 0.03 * Math.sin(now * 0.9));
+  ocDraw();
+  // the optics follow the arm that's playing, and the irises tighten on each slap
+  ocBody.updateMatrixWorld();
+  for (const e of ocEyes) {
+    const want = lookAt ? e.g.worldToLocal(ocTmp.copy(lookAt)).normalize() : V(Math.sin(now * 0.31) * 0.3, Math.sin(now * 0.47) * 0.2, 1).normalize();
+    e.gaze.lerp(want, 1 - Math.exp(-dt * 6)).normalize();
+    e.look.rotation.set(-clamp(e.gaze.y, -0.5, 0.5) * 0.6, clamp(e.gaze.x, -0.6, 0.6) * 0.6, 0);
+    e.iris.scale.setScalar(1 - 0.12 * Math.min(1, bodyKick));
+  }
+  for (const r of ocRipples) {
+    const tau = now - r.t0;
+    if (tau < 0 || tau > 1.1) { r.m.material.opacity = 0; continue; }
+    r.m.scale.setScalar(0.05 + tau * (0.35 + 0.35 * r.vel));
+    r.m.material.opacity = 0.85 * (1 - tau / 1.1) * (0.4 + 0.6 * r.vel);
+  }
+}
+
+// ---------- which arms play which part ----------
+// Every part gets an arm. When there are fewer parts than arms, the busiest parts get more, spread around the
+// body; with more parts than arms, the extra ones share the arm nearest their range.
+const OC_ORDER = [0, 4, 2, 6, 1, 5, 3, 7];
+function defaultOctoMap(entry) {
+  entry.octoMap = {};
+  const parts = entry.parts.filter(pt => pt.count > 0).sort((a, b) => b.count - a.count);
+  const arms = parts.slice(0, OC.ARMS).map(() => []);
+  let k = 0;
+  parts.slice(0, OC.ARMS).forEach((pt, i) => arms[i].push(OC_ORDER[k++]));
+  while (k < OC.ARMS && parts.length) {
+    let best = 0;
+    arms.forEach((a, i) => { if (parts[i].count / a.length > parts[best].count / arms[best].length) best = i; });
+    arms[best].push(OC_ORDER[k++]);
+  }
+  parts.slice(0, OC.ARMS).forEach((pt, i) => { entry.octoMap[pt.key] = arms[i].map(a => 'a' + a).join(','); });
+  for (const pt of parts.slice(OC.ARMS)) {
+    const mid = (pt.lo + pt.hi) / 2;
+    let best = 0;
+    parts.slice(0, OC.ARMS).forEach((q, i) => { if (Math.abs((q.lo + q.hi) / 2 - mid) < Math.abs((parts[best].lo + parts[best].hi) / 2 - mid)) best = i; });
+    entry.octoMap[pt.key] = 'a' + arms[best][0];
+  }
+  for (const pt of entry.parts) if (!entry.octoMap[pt.key]) entry.octoMap[pt.key] = 'off';
+}
+// the arm for a note: by pitch across the part's arms, or whichever has rested longest if that one is mid-slap
+function ocArmFor(ids, note, lo, hi, t) {
+  const arms = ids.map(id => ocArms[Number(id.slice(1))]);
+  let a = arms[Math.round(clamp(hi > lo ? (note - lo) / (hi - lo) : 0.5, 0, 1) * (arms.length - 1))];
+  if (t - a.last < 0.32) a = arms.reduce((m, x) => (x.last < m.last ? x : m), arms[0]);
+  return a;
+}
+const octoMachine = {
+  id: 'octo', label: 'Octopus', blurb: 'A white robot octopus. Every note winds an arm up and whips it out flat, so its tip slaps the floor right on the beat, then it springs back into its curl. Drag to orbit, scroll to zoom.',
+  wide: 4.4,
+  lead: () => OC_LEAD,
+  stage: () => ({ env: squishEnv, bg: OCTO_BG, fog: OCTO_FOG, backdrop: ocBackdrop }),
+  enter() {
+    octoWorld.visible = true; scene.background = OCTO_BG; scene.fog = OCTO_FOG; scene.environment = squishEnv; setBloom(0.25, 0.4, 1.6);
+    // white on a pale stage clips to flat white without a film curve; ACES rolls the highlights off and keeps the contrast
+    renderer.toneMapping = THREE.ACESFilmicToneMapping; renderer.toneMappingExposure = 1.05;
+    Object.assign(orbit, { theta: 0.35, phi: 0.36, r: this.wide }); orbit.target.set(0, 0.95, 0);
+  },
+  exit() { octoWorld.visible = false; scene.environment = null; renderer.toneMapping = THREE.NoToneMapping; renderer.toneMappingExposure = 1; },
+  load(entry) {
+    if (!entry.octoMap) defaultOctoMap(entry);
+    for (const a of ocArms) { a.notes = []; a.kicks = []; a.last = -10; }
+  },
+  schedule(e, hitAbs, entry) {
+    const ids = (entry.octoMap[e.part] || 'off').split(',').filter(id => id !== 'off');
+    if (!ids.length) return;
+    const pt = entry.parts.find(p => p.key === e.part), vel = e.vel / 127;
+    const arm = ocArmFor(ids, e.note, pt ? pt.lo : 48, pt ? pt.hi : 72, hitAbs);
+    arm.last = hitAbs;
+    const drum = pt && pt.ch === 9;
+    const hold = FX.hold && e.dur && !drum ? Math.min(e.dur, 2.5) : 0;
+    arm.notes.push({ t: hitAbs, end: hitAbs + hold, vel, note: e.note, color: drum ? new THREE.Color(0xff4b1f) : pitchColor(e.note), hit: false });
+    if (!soundOn || !actx) return;
+    if (drum) playDrum(KIT_NOTE[e.note] || pieceFromPitch(e.note), hitAbs, vel);
+    else playNote(guessKind(pt), e.note, hitAbs, vel, e.dur);
+    octoTap(audioNow() + Math.max(0, hitAbs - nowSec()), vel);
+  },
+  live(note, vel) {
+    const t = nowSec() + OC_LEAD, arm = ocArms[((note % OC.ARMS) + OC.ARMS) % OC.ARMS];
+    arm.last = t;
+    arm.notes.push({ t, end: t, vel: vel / 127, note, color: pitchColor(note), hit: false });
+    if (soundOn && actx) { playNote('marimba', note, t, vel / 127, 0.4); octoTap(audioNow() + OC_LEAD, vel / 127); }
+    return true;
+  },
+  update(now, dt) { updateOcto(now, dt); },
+  // auto camera: the whole animal, down an arm that's playing, low in front of the optics, or from above
+  pickShot() {
+    const busy = ocArms.reduce((m, a) => (a.heat > m.heat ? a : m), ocArms[0]), roll = Math.random();
+    if (busy.heat < 0.4 || roll < 0.3) return { theta: 0.35 + (Math.random() - 0.5) * 0.9, phi: 0.36, r: this.wide, target: V(0, 0.95, 0), drift: 0.025 };
+    if (roll < 0.6) return { theta: busy.a + (Math.random() - 0.5) * 0.7, phi: 0.3, r: 2.2, target: V(busy.out.x * 0.9, 0.55, busy.out.z * 0.9), drift: 0.03 };
+    if (roll < 0.85) return { theta: (Math.random() - 0.5) * 0.8, phi: 0.1, r: 3.8, target: V(0, 1.05, 0), drift: 0.02 };
+    return { theta: Math.random() * 6.28, phi: 1.05, r: this.wide * 0.95, target: V(0, 0.5, 0), drift: 0.04 };
+  },
+  inFlight: () => ocArms.filter(a => a.s > 0.05).length,
+  hits: () => octoHits,
+};
+function renderOctoParts(entry) {
+  const list = $('#partList');
+  list.innerHTML = '';
+  const single = ocArms.map(a => ['a' + a.i, `Arm ${a.i + 1}`]);
+  entry.parts.forEach((pt, i) => {
+    const v = entry.octoMap[pt.key];
+    const opts = [...(v.includes(',') ? [[v, 'Arms ' + v.split(',').map(id => Number(id.slice(1)) + 1).join(' + ')]] : []), ...single, ['off', 'Off']];
+    list.appendChild(partRow(pt, i, opts, v, nv => { entry.octoMap[pt.key] = nv; renderOctoParts(entry); }));
+  });
+  $('#parts').hidden = !entry.parts.length;
+  const off = entry.parts.filter(p => entry.octoMap[p.key] === 'off').length;
+  $('#partSummary').textContent = `${entry.parts.length} part${entry.parts.length > 1 ? 's' : ''} on ${OC.ARMS} arms` + (off ? ` · ${off} off` : '') + ' (click to change)';
+}
+
+const MACHINES = { pipe: pipeMachine, doll: dollMachine, squish: squishMachine, smokes: smokeMachine, hand: crawlMachine, octo: octoMachine };
 let machine = pipeMachine;
 
 // ---------- transport ----------
@@ -4490,7 +4930,7 @@ function setMachine(id) {
   const m = MACHINES[id];
   if (!m || m === machine) return;
   machine.exit();
-  if (LITE) releaseGpu({ pipe: pipeWorld, doll: dollWorld, squish: squishWorld, smokes: smokeWorld, hand: crawlWorld }[machine.id]);
+  if (LITE) releaseGpu({ pipe: pipeWorld, doll: dollWorld, squish: squishWorld, smokes: smokeWorld, hand: crawlWorld, octo: octoWorld }[machine.id]);
   machine = m;
   machine.enter();
   director.shot = null;
@@ -4523,7 +4963,7 @@ function fmt(t) { t = Math.max(0, t); return Math.floor(t / 60) + ':' + String(M
 const NOTE_NAMES = ['C', 'C♯', 'D', 'D♯', 'E', 'F', 'F♯', 'G', 'G♯', 'A', 'A♯', 'B'];
 const noteName = n => NOTE_NAMES[n % 12] + (Math.floor(n / 12) - 1);
 
-function renderParts(entry) { return machine === dollMachine ? renderDollParts(entry) : machine === squishMachine ? renderSquishParts(entry) : machine === smokeMachine ? renderSmokeParts(entry) : machine === crawlMachine ? renderCrawlParts(entry) : renderPipeParts(entry); }
+function renderParts(entry) { return machine === dollMachine ? renderDollParts(entry) : machine === squishMachine ? renderSquishParts(entry) : machine === smokeMachine ? renderSmokeParts(entry) : machine === crawlMachine ? renderCrawlParts(entry) : machine === octoMachine ? renderOctoParts(entry) : renderPipeParts(entry); }
 function partRow(pt, i, options, value, onchange) {
   const row = document.createElement('div');
   row.className = 'part';
@@ -4704,7 +5144,7 @@ async function discoverSongs() {
 // ---------- your song library: every song you load is kept in this browser ----------
 // Each song is stored with its MIDI bytes, whether it's a favourite, when it was last played, the machine it
 // was last played on and its part mappings, so it comes back next visit ready to go.
-const MAP_KEYS = ['dollMap', 'squishMap', 'smokeMap', 'crawlMap'];
+const MAP_KEYS = ['dollMap', 'squishMap', 'smokeMap', 'crawlMap', 'octoMap'];
 function songId(name, buf) {
   const b = new Uint8Array(buf);
   let h = 2166136261;
@@ -4918,6 +5358,7 @@ $('#autoAssign').onclick = () => {
   else if (machine === squishMachine) { defaultSquishMap(current); buildBlobs(current); }
   else if (machine === smokeMachine) { defaultSmokeMap(current); buildPacks(current); }
   else if (machine === crawlMachine) { defaultCrawlMap(current); crawlRange(current); }
+  else if (machine === octoMachine) defaultOctoMap(current);
   else { current.manual = {}; assignParts(current); buildLayout(current.specs); }
   renderParts(current);
   setStatus(`Every part of ${current.name} is mapped automatically again.`);
@@ -5065,7 +5506,7 @@ $('#kitRec').onclick = async () => {
 renderSound();
 loadTakes();
 // stage light scales every stage lamp on both machines; glow strength scales the bloom
-const STAGE_LIGHTS = [[pipeHemi, 0.35], [sun, 0.8], [core, 0.6], [dollHemi, 0.3], [rimPink, 0.8], [rimWhite, 0.5], [fill, 0.35], [sqHemi, 0.5], [sqKey, 1.4], [sqRim, 1.1], [smHemi, 0.35], [smKey, 1.6], [smRim, 1.2], [crHemi, 0.4], [crKey, 2.2], [crRim, 1.3]];
+const STAGE_LIGHTS = [[pipeHemi, 0.35], [sun, 0.8], [core, 0.6], [dollHemi, 0.3], [rimPink, 0.8], [rimWhite, 0.5], [fill, 0.35], [sqHemi, 0.5], [sqKey, 1.4], [sqRim, 1.1], [smHemi, 0.35], [smKey, 1.6], [smRim, 1.2], [crHemi, 0.4], [crKey, 2.2], [crRim, 1.3], [ocHemi, 0.35], [ocKey, 1.0], [ocFill, 0.25], [ocRim, 0.5]];
 // ---------- environments: Poly Haven HDRIs (CC0) that light and reflect on either machine ----------
 const ENVS = [
   ['builtin', 'Built-in'],
@@ -5222,7 +5663,9 @@ function onMidi(e) {
 // ---------- auto camera: picks a shot from the machine every few seconds and eases toward it ----------
 const director = { shot: null, next: 0 };
 function angleTo(a, b) { let d = (b - a) % (2 * Math.PI); if (d > Math.PI) d -= 2 * Math.PI; if (d < -Math.PI) d += 2 * Math.PI; return d; }
+let filmCam = null;   // a review sheet can pin the camera: { theta, phi, r, target: [x, y, z] }
 function directCamera(now, dt) {
+  if (filmCam) { Object.assign(orbit, { theta: filmCam.theta, phi: filmCam.phi, r: filmCam.r }); orbit.target.set(...filmCam.target); return true; }
   // dragging or scrolling hands the camera to the viewer for 8 seconds
   if (!FX.director || reduceMotion || drag || now - lastTouch < 8 || !machine.pickShot) { director.shot = null; return false; }
   if (!director.shot || now > director.next) { director.shot = machine.pickShot(now); director.next = now + 4.5 + Math.random() * 3.5; }
@@ -5239,7 +5682,7 @@ function directCamera(now, dt) {
 // ---------- film: the song rendered frame by frame into a video, with its real sound ----------
 // Nothing is screen-recorded. The clock stops following the wall and steps exactly one frame at a time, so a slow
 // frame can't be dropped and every landing sits on its beat. Each frame can take as long as it likes, which buys
-// quality a live page can't afford: ambient occlusion, bigger shadow maps and every frame drawn at twice the size
+// quality a live page can't afford: ambient occlusion, bigger shadow maps and every frame drawn at 1.5 times the size
 // and scaled down. The sound is the same instruments, rendered offline on the same clock, so it can't drift.
 // Randomness is seeded, so the same song on the same machine films the same way twice.
 const FILM_FORMATS = { wide: [1920, 1080, 'Landscape 16:9'], tall: [1080, 1920, 'Vertical 9:16'], square: [1080, 1080, 'Square 1:1'] };
@@ -5250,7 +5693,7 @@ function seeded(seed) {
   return () => { seed |= 0; seed = (seed + 0x6D2B79F5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
 }
 // yields to the page without the timer throttling a background tab gets
-const breathe = () => new Promise(r => { const c = new MessageChannel(); c.port1.onmessage = () => r(); c.port2.postMessage(0); });
+const breathe = () => new Promise(r => { const c = new MessageChannel(); c.port1.onmessage = () => { c.port1.close(); r(); }; c.port2.postMessage(0); });
 async function samplesSettled(ms = 12000) {
   const end = performance.now() + ms;
   while (Object.values(sampleBank).some(s => s.state === 'loading') && performance.now() < end) await new Promise(r => setTimeout(r, 100));
@@ -5290,7 +5733,7 @@ function filmSize(W, H) {
 function drawTitle(g, w, h, t, entry) {
   const a = Math.min(clamp((t - 0.4) / 0.6, 0, 1), clamp((5 - t) / 0.8, 0, 1));
   if (a <= 0) return;
-  const u = Math.min(w, h) / 1080, x = 72 * u, y = h - 96 * u, dark = machine.id === 'doll' || machine.id === 'squish';
+  const u = Math.min(w, h) / 1080, x = 72 * u, y = h - 96 * u, dark = machine.id === 'doll' || machine.id === 'squish' || machine.id === 'octo';
   g.save();
   g.globalAlpha = a;
   g.translate(0, (1 - a) * 14 * u);
@@ -5393,7 +5836,8 @@ async function pickCodec(list, Enc, base) {
 async function recordFilm() {
   if (!current || !current.notes.length) { setStatus('Load a song first, then record it.'); return; }
   if (!window.VideoEncoder) { setStatus('This browser can\'t make video files. Use Chrome or Edge on a computer.'); return; }
-  const [w, h] = FILM_FORMATS[FILM.format], fps = FILM.fps, ss = FILM.hq ? 2 : 1;
+  // 1.5x supersampling: 2x at 1080p means 4K targets for every pass, more graphics memory than many machines give a tab
+  const [w, h] = FILM_FORMATS[FILM.format], fps = FILM.fps, ss = FILM.hq ? 1.5 : 1;
   const ui = $('#filmBox'), bar = $('#filmBar'), note = $('#filmNote'), save = $('#filmSave');
   ui.hidden = false; save.hidden = true; $('#filmCancel').hidden = false; bar.value = 0;
   note.textContent = 'Getting ready…';
@@ -5480,7 +5924,8 @@ async function recordFilm() {
 }
 // review sheets: stills at chosen song times, tiled and labelled, the same frames the film would hold
 window.pipeFilm = {
-  async sheet(times, { w = 960, h = 540, cols = 4, hq = true } = {}) {
+  async sheet(times, { w = 960, h = 540, cols = 4, hq = true, cam = null } = {}) {
+    filmCam = cam;
     const want = times.map(t => Math.round(t * 60));
     const tw = Math.round(w / 2), th = Math.round(h / 2), rows = Math.ceil(times.length / cols);
     const sheet = document.createElement('canvas'); sheet.width = cols * tw; sheet.height = rows * th;
@@ -5488,7 +5933,7 @@ window.pipeFilm = {
     sg.fillStyle = '#333'; sg.fillRect(0, 0, sheet.width, sheet.height);
     let k = 0;
     await shoot({
-      w, h, fps: 60, ss: hq ? 2 : 1, hq, sound: false, titles: false,
+      w, h, fps: 60, ss: hq ? 1.5 : 1, hq, sound: false, titles: false,
       draw: i => want.includes(i),
       frame: (i, t, pic) => {
         for (let j = 0; j < want.length; j++) if (want[j] === i) {
@@ -5500,7 +5945,7 @@ window.pipeFilm = {
         }
         if (k >= want.length) filmCancel = true;
       },
-    }).catch(err => { if (err.message !== 'cancelled') throw err; });
+    }).catch(err => { if (err.message !== 'cancelled') throw err; }).finally(() => { filmCam = null; });
     return sheet.toDataURL('image/png');
   },
   // the song times its notes land on (seconds from the start of the film)
