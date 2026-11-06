@@ -415,6 +415,14 @@ let composer = null, bloomPass = null;
 if (THREE.EffectComposer && THREE.RenderPass && THREE.UnrealBloomPass && THREE.OutputPass) {
   composer = new THREE.EffectComposer(renderer, new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType }));
   composer.addPass(new THREE.RenderPass(scene, camera));
+  // A mirror-smooth highlight can be brighter than a half-float pixel holds: it becomes infinity, the glow
+  // spreads it into blocks and the tone curve turns it into NaN, which shows as black. Clamp it first.
+  if (THREE.ShaderPass) composer.addPass(new THREE.ShaderPass({
+    uniforms: { tDiffuse: { value: null } },
+    vertexShader: 'varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+    fragmentShader: `uniform sampler2D tDiffuse; varying vec2 vUv;
+      void main() { vec4 c = texture2D(tDiffuse, vUv); if (any(isnan(c)) || any(isinf(c))) c = vec4(0.0, 0.0, 0.0, 1.0); gl_FragColor = vec4(min(c.rgb, vec3(48.0)), c.a); }`,
+  }));
   bloomPass = new THREE.UnrealBloomPass(new THREE.Vector2(1, 1), 0.9, 0.5, 0.72);
   composer.addPass(bloomPass);
   composer.addPass(new THREE.OutputPass());   // the render targets are linear
@@ -4591,7 +4599,7 @@ const ocEyes = [-1, 1].map(side => {
   look.position.z = 0.083;
   const iris = new THREE.Mesh(new THREE.CircleGeometry(0.104, 56), new THREE.MeshStandardMaterial({ map: ocIrisTex, roughness: 0.35, metalness: 0.6, userData: { envBase: 0.6 } }));
   const dome = new THREE.Mesh(new THREE.SphereGeometry(0.104, 48, 24, 0, 2 * Math.PI, 0, Math.PI / 2).rotateX(Math.PI / 2),
-    new THREE.MeshPhysicalMaterial({ color: 0x020203, roughness: 0.04, clearcoat: 1, clearcoatRoughness: 0.02, transparent: true, opacity: 0.5, userData: { envBase: 0.15 } }));
+    new THREE.MeshPhysicalMaterial({ color: 0x020203, roughness: 0.1, clearcoat: 1, clearcoatRoughness: 0.08, transparent: true, opacity: 0.5, userData: { envBase: 0.15 } }));
   dome.scale.z = 0.45;
   look.add(iris, dome);
   for (const m of [housing, ring, bezel]) { m.castShadow = true; g.add(m); }
