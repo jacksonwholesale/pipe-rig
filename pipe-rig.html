@@ -4623,16 +4623,19 @@ for (let k = 0; k < OC.N; k++) {
 }
 const OC_ROOT = { r: OC.R * 0.6, y: -OC.R * 0.66 };
 const OC_REST = { curl: -0.9, phi: 0.55 }, OC_STRIKE = { curl: 0.16, phi: -0.9, k: OC.N };
+// the two front arms are legs: spread wide under the optics, planted on the floor with a foot turned out
+const OC_LEG = { curl: 0.45, spread: 0.72, lift: 0.08 };
 const ocArms = Array.from({ length: OC.ARMS }, (_, i) => {
-  const a = (i + 0.5) / OC.ARMS * 2 * Math.PI;
+  const leg = i === 0 || i === OC.ARMS - 1;
+  const a = leg ? (i === 0 ? OC_LEG.spread : -OC_LEG.spread) : (i + 0.5) / OC.ARMS * 2 * Math.PI;
   const out = V(Math.sin(a), 0, Math.cos(a));
   const collar = new THREE.Mesh(new THREE.CylinderGeometry(OC.R0 * 1.25, OC.R0 * 1.45, 0.07, 32), ocDarkMat);
   collar.castShadow = true; ocBody.add(collar);
   return {
-    i, a, out, axis: new THREE.Vector3().crossVectors(out, V(0, 1, 0)).normalize(), collar,
+    i, a, out, leg, contact: OC.N, axis: new THREE.Vector3().crossVectors(out, V(0, 1, 0)).normalize(), collar,
     J: Array.from({ length: OC.N + 1 }, () => V(0, 0, 0)), D: Array.from({ length: OC.N }, () => V(0, 0, 0)), X: Array.from({ length: OC.N }, () => V(0, 0, 0)),
     roll: Array.from({ length: OC.N }, () => ocRnd() * Math.PI * 2),
-    rest: i === 0 || i === 7 ? -1.15 : OC_REST.phi + (i % 2 ? -0.3 : 0.12) + (ocRnd() - 0.5) * 0.16, restCurl: i === 0 || i === 7 ? -0.28 : OC_REST.curl, notes: [], kicks: [], heat: 0, last: -10, s: 0,
+    rest: OC_REST.phi + (i % 2 ? -0.3 : 0.12) + (ocRnd() - 0.5) * 0.16, restCurl: OC_REST.curl, notes: [], kicks: [], heat: 0, last: -10, s: 0,
   };
 });
 const ocM = new THREE.Matrix4(), ocQ = new THREE.Quaternion(), ocS = V(1, 1, 1), ocP = V(0, 0, 0);
@@ -4665,6 +4668,18 @@ function ocPose(arm, curl, phi, sway, wob) {
     if (low > 0.004) hi = mid; else lo = mid;
   }
   OC_STRIKE.phi = (lo + hi) / 2;
+}
+// sets the root angle so the arm's lowest link sits `lift` above the floor (bisection; the lowest link is the foot)
+function ocPlant(arm, curl, lift, sway) {
+  let lo = -1.7, hi = 0.2;
+  for (let it = 0; it < 14; it++) {
+    const mid = (lo + hi) / 2;
+    ocPose(arm, curl, mid, sway, null);
+    let low = 1e9;
+    for (let k = 1; k <= OC.N; k++) { const y = arm.J[k].y - OC_RAD[k - 1]; if (y < low) { low = y; arm.contact = k; } }
+    if (low > lift) hi = mid; else lo = mid;
+  }
+  ocPose(arm, curl, (lo + hi) / 2, sway, null);
 }
 function ocBasis(arm, k) {
   ocBy.copy(arm.D[k]);
@@ -4749,14 +4764,19 @@ function ocStrike(arm, now) {
 const ocWob = new Float32Array(OC.N);
 function updateOcto(now, dt) {
   let bodyKick = 0, lookAt = null, lookT = -1e9;
+  for (const arm of ocArms) for (const kk of arm.kicks) if (now >= kk.t) bodyKick += kk.vel * Math.exp(-(now - kk.t) * 6);
+  // the body hovers, bobs and dips a little under every slap; the legs take the dip
+  ocBody.position.y = OC.Y + 0.025 * Math.sin(now * 1.3) - 0.035 * Math.min(1.5, bodyKick);
+  ocBody.rotation.set(0.03 * Math.sin(now * 0.7), 0.06 * Math.sin(now * 0.23), 0.03 * Math.sin(now * 0.9));
   for (const arm of ocArms) {
     arm.notes = arm.notes.filter(n => now < Math.max(n.t, n.end) + 1.5);
     arm.kicks = arm.kicks.filter(k => now < k.t + 1.6);
     for (const n of arm.notes) if (!n.hit && now >= n.t) {
       n.hit = true; octoHits++; arm.heat += n.vel; grooveHit(n.vel);
       arm.kicks.push({ t: n.t, vel: n.vel });
-      ocRipple(arm.J[OC_STRIKE.k], n.color, n.vel, n.t);
-      flashAt(ocTmp.copy(arm.J[OC_STRIKE.k]).setY(0.08), n.color, n.vel * 0.5, 1.4, 7, 0.5);
+      const foot = arm.J[arm.leg ? arm.contact : OC_STRIKE.k];
+      ocRipple(foot, n.color, n.vel, n.t);
+      flashAt(ocTmp.copy(foot).setY(0.08), n.color, n.vel * 0.5, 1.4, 7, 0.5);
     }
     arm.heat *= Math.exp(-dt * 0.7);
     const { s, w, b } = ocStrike(arm, now);
@@ -4766,8 +4786,14 @@ function updateOcto(now, dt) {
     for (const kk of arm.kicks) {
       const tau = now - kk.t;
       if (tau < 0) continue;
-      bodyKick += kk.vel * Math.exp(-tau * 6);
       for (let k = 0; k < OC.N; k++) ocWob[k] += kk.vel * 0.05 * Math.exp(-tau * 4.5) * Math.sin(16 * tau - k * 0.55) * ((k + 1) / OC.N);
+    }
+    if (arm.leg) {
+      // a leg stomps: the windup lifts the foot and it comes down on the beat
+      ocPlant(arm, OC_LEG.curl, OC_LEG.lift * w, 0.05 * Math.sin(now * 0.37 + arm.i));
+      const last = arm.notes.reduce((m, n) => (n.t <= now + 0.3 && (!m || n.t > m.t) ? n : m), null);
+      if (last && last.t > lookT) { lookT = last.t; lookAt = arm.J[arm.contact]; }
+      continue;
     }
     const breathe = 0.05 * Math.sin(now * 0.9 + arm.i * 0.8) * grooveAmt();
     const curl = arm.restCurl + (OC_STRIKE.curl - arm.restCurl) * s - 0.16 * w - b + breathe;
@@ -4777,9 +4803,6 @@ function updateOcto(now, dt) {
     const last = arm.notes.reduce((m, n) => (n.t <= now + 0.3 && (!m || n.t > m.t) ? n : m), null);
     if (last && last.t > lookT) { lookT = last.t; lookAt = arm.J[OC.N]; }
   }
-  // the body hovers, bobs and dips a little under every slap
-  ocBody.position.y = OC.Y + 0.025 * Math.sin(now * 1.3) - 0.035 * Math.min(1.5, bodyKick);
-  ocBody.rotation.set(0.03 * Math.sin(now * 0.7), 0.06 * Math.sin(now * 0.23), 0.03 * Math.sin(now * 0.9));
   ocDraw();
   // the optics follow the arm that's playing, and the irises tighten on each slap
   ocBody.updateMatrixWorld();
